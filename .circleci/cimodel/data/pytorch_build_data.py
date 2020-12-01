@@ -1,28 +1,40 @@
 #!/usr/bin/env python3
 
-from cimodel.lib.conf_tree import ConfigNode, X
+from cimodel.lib.conf_tree import ConfigNode, X, XImportant
 
 
 CONFIG_TREE_DATA = [
-    ("trusty", [
+    ("xenial", [
         (None, [
-            X("2.7.9"),
+            XImportant("2.7.9"),
             X("2.7"),
-            X("3.5"),
+            XImportant("3.5"),  # Not run on all PRs, but should be included on [test all]
             X("nightly"),
         ]),
         ("gcc", [
             ("4.8", [X("3.6")]),
-            ("5.4", [("3.6", [X(False), X(True)])]),
+            ("5.4", [  # All this subtree rebases to master and then build
+                XImportant("3.6"),
+                ("3.6", [
+                    ("namedtensor", [XImportant(True)]),
+                ]),
+            ]),
             ("7", [X("3.6")]),
         ]),
-    ]),
-    ("xenial", [
         ("clang", [
-            ("5", [X("3.6")]),
+            ("5", [
+                XImportant("3.6"),  # This is actually the ASAN build
+                ("3.6", [
+                    ("namedtensor", [XImportant(True)]),  # ASAN
+                ]),
+            ]),
+            ("7", [
+                ("3.6", [
+                    ("xla", [XImportant(True)]),
+                ]),
+            ]),
         ]),
         ("cuda", [
-            ("8", [X("3.6")]),
             ("9", [
                 # Note there are magic strings here
                 # https://github.com/pytorch/pytorch/blob/master/.jenkins/pytorch/build.sh#L21
@@ -32,13 +44,24 @@ CONFIG_TREE_DATA = [
                 # https://github.com/pytorch/pytorch/blob/master/.jenkins/pytorch/build.sh#L153
                 # (from https://github.com/pytorch/pytorch/pull/17323#discussion_r259453144)
                 X("2.7"),
-                X("3.6"),
+                XImportant("3.6"),
+                ("2.7", [
+                    ("namedtensor", [XImportant(True)]),
+                ]),
             ]),
             ("9.2", [X("3.6")]),
             ("10", [X("3.6")]),
+            ("10.1", [X("3.6")]),
         ]),
         ("android", [
-            ("r19c", [X("3.6")]),
+            ("r19c", [
+                ("3.6", [
+                    ("android_abi", [XImportant("x86_32")]),
+                    ("android_abi", [X("x86_64")]),
+                    ("android_abi", [X("arm-v7a")]),
+                    ("android_abi", [X("arm-v8a")]),
+                ])
+            ]),
         ]),
     ]),
 ]
@@ -82,32 +105,9 @@ class DistroConfigNode(TreeConfigNode):
         distro = self.find_prop("distro_name")
 
         next_nodes = {
-            "trusty": TrustyCompilerConfigNode,
             "xenial": XenialCompilerConfigNode,
         }
         return next_nodes[distro]
-
-
-class TrustyCompilerConfigNode(TreeConfigNode):
-
-    def modify_label(self, label):
-        return label or "<unspecified>"
-
-    def init2(self, node_name):
-        self.props["compiler_name"] = node_name
-
-    def child_constructor(self):
-        return TrustyCompilerVersionConfigNode if self.props["compiler_name"] else PyVerConfigNode
-
-
-class TrustyCompilerVersionConfigNode(TreeConfigNode):
-
-    def init2(self, node_name):
-        self.props["compiler_version"] = node_name
-
-    # noinspection PyMethodMayBeStatic
-    def child_constructor(self):
-        return PyVerConfigNode
 
 
 class PyVerConfigNode(TreeConfigNode):
@@ -117,7 +117,23 @@ class PyVerConfigNode(TreeConfigNode):
 
     # noinspection PyMethodMayBeStatic
     def child_constructor(self):
-        return XlaConfigNode
+        return ExperimentalFeatureConfigNode
+
+
+class ExperimentalFeatureConfigNode(TreeConfigNode):
+    def init2(self, node_name):
+        self.props["experimental_feature"] = node_name
+
+    def child_constructor(self):
+        experimental_feature = self.find_prop("experimental_feature")
+
+        next_nodes = {
+            "xla": XlaConfigNode,
+            "namedtensor": NamedTensorConfigNode,
+            "important": ImportantConfigNode,
+            "android_abi": AndroidAbiConfigNode,
+        }
+        return next_nodes[experimental_feature]
 
 
 class XlaConfigNode(TreeConfigNode):
@@ -127,15 +143,51 @@ class XlaConfigNode(TreeConfigNode):
     def init2(self, node_name):
         self.props["is_xla"] = node_name
 
+    def child_constructor(self):
+        return ImportantConfigNode
+
+
+class NamedTensorConfigNode(TreeConfigNode):
+    def modify_label(self, label):
+        return "NAMEDTENSOR=" + str(label)
+
+    def init2(self, node_name):
+        self.props["is_namedtensor"] = node_name
+
+    def child_constructor(self):
+        return ImportantConfigNode
+
+class AndroidAbiConfigNode(TreeConfigNode):
+
+    def init2(self, node_name):
+        self.props["android_abi"] = node_name
+
+    def child_constructor(self):
+        return ImportantConfigNode
+
+class ImportantConfigNode(TreeConfigNode):
+    def modify_label(self, label):
+        return "IMPORTANT=" + str(label)
+
+    def init2(self, node_name):
+        self.props["is_important"] = node_name
+
+    def get_children(self):
+        return []
+
 
 class XenialCompilerConfigNode(TreeConfigNode):
+
+    def modify_label(self, label):
+        return label or "<unspecified>"
 
     def init2(self, node_name):
         self.props["compiler_name"] = node_name
 
     # noinspection PyMethodMayBeStatic
     def child_constructor(self):
-        return XenialCompilerVersionConfigNode
+
+        return XenialCompilerVersionConfigNode if self.props["compiler_name"] else PyVerConfigNode
 
 
 class XenialCompilerVersionConfigNode(TreeConfigNode):

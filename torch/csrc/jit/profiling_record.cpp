@@ -1,4 +1,5 @@
 #include <torch/csrc/jit/profiling_record.h>
+#include <torch/csrc/jit/passes/constant_propagation.h>
 
 namespace torch {
 namespace jit {
@@ -6,48 +7,52 @@ namespace jit {
 ProfilingRecord::ProfilingRecord(std::shared_ptr<Graph> g)
     : profiled_graph_(std::move(g)), profiling_count_(3) {}
 
-Node* ProfilingRecord::createProfileNode(
+ProfileOp* ProfilingRecord::createProfileNode(
     const std::function<void(Stack&)>& fp,
     at::ArrayRef<Value*> inputs) {
-  auto pn = profiled_graph_->create(prim::profile, 0);
+  auto pn = new ProfileOp(profiled_graph_.get(), fp);
+
   for (auto in : inputs) {
     pn->addInput(in);
   }
-
-  callbacks_.push_back(fp);
-  auto& stored_fp = callbacks_.back();
-  pn->i_(attr::data, reinterpret_cast<int64_t>(&stored_fp));
   return pn;
 }
 
 void ProfilingRecord::instrumentBlock(Block* block) {
-
-  // iterating backwards allows us to easily insert profile nodes
-  // without affecting an iterator
-  for (auto it = block->nodes().rend(); it != block->nodes().rbegin(); --it) {
+  for (auto it = block->nodes().begin(); it != block->nodes().end(); ++it) {
     auto n = *it;
-    for (auto o : n->outputs()) {
-      if (!o->type()->isSubclass(TypeKind::TensorType)) {
+    for (auto i : n->inputs()) {
+      if (!i->type()->isSubtypeOf(TensorType::get()) ||
+          i->node()->kind() == prim::profile) {
         continue;
       }
 
-      std::function<void(Stack&)> shape_profiler = [this, o](Stack& stack) {
-        IValue t;
-        pop(stack, t);
-        if (t.isTensor()) {
-          auto pttp = ProfiledTensorType::create(t.toTensor());
-          std::lock_guard<std::mutex> lock(this->mutex_);
-          if (o->type()->isSubclass(TypeKind::ProfiledTensorType)) {
-            auto type = o->type()->cast<ProfiledTensorType>();
-            o->setType(type->merge(pttp));
-          } else {
-            o->setType(pttp);
-          }
-        }
-      };
+      auto pn = createProfileNode(nullptr, {i});
+      auto pno = pn->addOutput();
+      bool first = true;
+      pno->setType(TensorType::get());
+      std::function<void(Stack&)> shape_profiler =
+          [this, pno, first](Stack& stack) mutable {
+            IValue t;
+            pop(stack, t);
+            if (t.isTensor()) {
+              auto pttp = TensorType::create(t.toTensor());
+              std::lock_guard<std::mutex> lock(this->mutex_);
+              if (auto type = pno->type()->cast<TensorType>()) {
+                if (!first) {
+                  pttp = pttp->merge(type);
+                }
+                pno->setType(pttp);
+                first = false;
+              }
+            }
+            // passing t through
+            push(stack, t);
+          };
 
-      auto pn = createProfileNode(shape_profiler, {o});
-      pn->insertAfter(n);
+      pn->setCallback(shape_profiler);
+      pn->insertBefore(n);
+      n->replaceInputWith(i, pn->output());
     }
 
     for (auto b : n->blocks()) {
@@ -65,7 +70,10 @@ std::unique_ptr<ProfilingRecord> ProfilingRecord::instrumentGraph(
   pr->instrumentBlock(new_g->block());
   std::function<void(Stack&)> counter = [raw_pr](Stack&) {
     std::lock_guard<std::mutex> lock(raw_pr->mutex_);
-    raw_pr->profiling_count_--;
+    if (raw_pr->profiling_count_ > 0)
+    {
+        raw_pr->profiling_count_--;
+    }
   };
 
   auto pop = pr->createProfileNode(counter, {});
@@ -73,16 +81,14 @@ std::unique_ptr<ProfilingRecord> ProfilingRecord::instrumentGraph(
   return pr;
 }
 
-ProfiledTensorTypePtr ProfilingRecord::toProfiledTensorTypePtr(const IValue& ival)
-{
-  if (ival.isTensor())
-  {
+TensorTypePtr ProfilingRecord::toTensorTypePtr(const IValue& ival) {
+  if (ival.isTensor()) {
     auto tensor = ival.toTensor();
-    return ProfiledTensorType::create(tensor);
+    return TensorType::create(tensor);
   }
 
   return {nullptr};
 }
 
-} //jit
-} //torch
+} // namespace jit
+} // namespace torch

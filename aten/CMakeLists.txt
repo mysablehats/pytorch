@@ -1,14 +1,17 @@
-if (BUILD_ATEN_MOBILE)
+if (NOT INTERN_BUILD_ATEN_OPS)
   return()
 endif()
 
 # Find modules
+if (NOT INTERN_BUILD_MOBILE)
+  list(APPEND CMAKE_MODULE_PATH /usr/lib/x86_64-linux-gnu/)
+  list(APPEND CMAKE_LIBRARY_PATH /usr/lib/x86_64-linux-gnu/ /usr/lib/aarch64-linux-gnu/)
+endif()
+
 list(APPEND CMAKE_MODULE_PATH
-  /usr/lib/x86_64-linux-gnu/
   ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/Modules
   ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/public
   ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/Modules_CUDA_fix)
-list(APPEND CMAKE_LIBRARY_PATH /usr/lib/x86_64-linux-gnu/ /usr/lib/aarch64-linux-gnu/)
 
 cmake_policy(SET CMP0012 NEW)
 
@@ -21,6 +24,7 @@ set(ATen_THIRD_PARTY_INCLUDE)
 set(ATen_CUDA_SRCS)
 set(ATen_CUDA_TEST_SRCS)
 set(ATen_CUDA_INCLUDE)
+set(ATen_NVRTC_STUB_SRCS)
 set(ATen_HIP_SRCS)
 set(ATen_HIP_TEST_SRCS)
 set(ATen_HIP_INCLUDE)
@@ -98,6 +102,7 @@ add_subdirectory(src/ATen)
 set(ATen_CPU_SRCS ${ATen_CPU_SRCS} PARENT_SCOPE)
 set(ATen_CUDA_SRCS ${ATen_CUDA_SRCS} PARENT_SCOPE)
 set(ATen_HIP_SRCS ${ATen_HIP_SRCS} PARENT_SCOPE)
+set(ATen_NVRTC_STUB_SRCS ${ATen_NVRTC_STUB_SRCS} PARENT_SCOPE)
 set(ATen_CPU_TEST_SRCS ${ATen_CPU_TEST_SRCS} PARENT_SCOPE)
 set(ATen_CUDA_TEST_SRCS ${ATen_CUDA_TEST_SRCS} PARENT_SCOPE)
 set(ATen_HIP_TEST_SRCS ${ATen_HIP_TEST_SRCS} PARENT_SCOPE)

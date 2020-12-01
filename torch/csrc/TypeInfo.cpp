@@ -55,10 +55,10 @@ PyObject* THPFInfo_pynew(PyTypeObject* type, PyObject* args, PyObject* kwargs) {
 
   torch::ParsedArgs<1> parsed_args;
   auto r = parser.parse(args, kwargs, parsed_args);
-  AT_CHECK(r.idx < 2, "Not a type");
+  TORCH_CHECK(r.idx < 2, "Not a type");
   at::ScalarType scalar_type;
   if (r.idx == 1) {
-    scalar_type = torch::tensors::get_default_tensor_type().scalarType();
+    scalar_type = torch::tensors::get_default_scalar_type();
     // The default tensor type can only be set to a floating point type/
     AT_ASSERT(at::isFloatingType(scalar_type));
   } else {
@@ -81,10 +81,15 @@ PyObject* THPIInfo_pynew(PyTypeObject* type, PyObject* args, PyObject* kwargs) {
   });
   torch::ParsedArgs<1> parsed_args;
   auto r = parser.parse(args, kwargs, parsed_args);
-  AT_CHECK(r.idx == 0, "Not a type");
+  TORCH_CHECK(r.idx == 0, "Not a type");
 
   at::ScalarType scalar_type = r.scalartype(0);
-  if (!at::isIntegralType(scalar_type)) {
+  if (scalar_type == at::ScalarType::Bool) {
+    return PyErr_Format(
+        PyExc_TypeError,
+        "torch.bool is not supported by torch.iinfo");
+  }
+  if (!at::isIntegralType(scalar_type, /*includeBool=*/false) && !at::isQIntType(scalar_type)) {
     return PyErr_Format(
         PyExc_TypeError,
         "torch.iinfo() requires an integer input type. Use torch.finfo to handle '%s'",
@@ -141,14 +146,26 @@ static PyObject* THPFInfo_min(THPFInfo* self, void*) {
 }
 
 static PyObject* THPIInfo_max(THPFInfo* self, void*) {
-  return AT_DISPATCH_INTEGRAL_TYPES(self->type, "max", [] {
-    return THPUtils_packInt64(std::numeric_limits<scalar_t>::max());
+  if (at::isIntegralType(self->type, /*includeBool=*/false)) {
+    return AT_DISPATCH_INTEGRAL_TYPES(self->type, "max", [] {
+      return THPUtils_packInt64(std::numeric_limits<scalar_t>::max());
+    });
+  }
+  // Quantized Type
+  return AT_DISPATCH_QINT_TYPES(self->type, "max", [] {
+      return THPUtils_packInt64(std::numeric_limits<underlying_t>::max());
   });
 }
 
 static PyObject* THPIInfo_min(THPFInfo* self, void*) {
-  return AT_DISPATCH_INTEGRAL_TYPES(self->type, "min", [] {
-    return THPUtils_packInt64(std::numeric_limits<scalar_t>::lowest());
+  if (at::isIntegralType(self->type, /*includeBool=*/false)) {
+    return AT_DISPATCH_INTEGRAL_TYPES(self->type, "min", [] {
+      return THPUtils_packInt64(std::numeric_limits<scalar_t>::lowest());
+    });
+  }
+  // Quantized Type
+  return AT_DISPATCH_QINT_TYPES(self->type, "min", [] {
+      return THPUtils_packInt64(std::numeric_limits<underlying_t>::lowest());
   });
 }
 

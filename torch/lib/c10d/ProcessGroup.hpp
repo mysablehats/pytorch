@@ -52,6 +52,9 @@ class ProcessGroup {
     // Returns source rank if this objects represents a recv-from-any.
     virtual int sourceRank() const;
 
+    // Returns result tensors, if applicable.
+    virtual std::vector<at::Tensor> result() const;
+
     // Ensures that operations on the output tensors that are invoked
     // after this function returns are correctly sequenced after the
     // asynchronous completion of this work.
@@ -108,6 +111,10 @@ class ProcessGroup {
       std::vector<at::Tensor>& data,
       const AllreduceOptions& opts = AllreduceOptions()) = 0;
 
+  virtual std::shared_ptr<ProcessGroup::Work> allreduce_coalesced(
+      std::vector<at::Tensor>& tensors,
+      const AllreduceCoalescedOptions& opts = AllreduceCoalescedOptions()) = 0;
+
   virtual std::shared_ptr<ProcessGroup::Work> reduce(
       std::vector<at::Tensor>& tensors,
       const ReduceOptions& opts = ReduceOptions()) = 0;
@@ -126,6 +133,11 @@ class ProcessGroup {
       std::vector<at::Tensor>& outputTensors,
       std::vector<std::vector<at::Tensor>>& inputTensors,
       const ScatterOptions& opts = ScatterOptions()) = 0;
+
+  virtual std::shared_ptr<ProcessGroup::Work> reduce_scatter(
+      std::vector<at::Tensor>& outputTensors,
+      std::vector<std::vector<at::Tensor>>& inputTensors,
+      const ReduceScatterOptions& opts = ReduceScatterOptions()) = 0;
 
   virtual std::shared_ptr<ProcessGroup::Work> send(
       std::vector<at::Tensor>& tensors,

@@ -41,15 +41,15 @@ static void upsample_bilinear2d_out_frame(
     }
     return;
   }
-  const scalar_t rheight = linear_upsample_compute_scale<scalar_t>(
+  const scalar_t rheight = area_pixel_compute_scale<scalar_t>(
       input_height, output_height, align_corners);
 
-  const scalar_t rwidth = linear_upsample_compute_scale<scalar_t>(
+  const scalar_t rwidth = area_pixel_compute_scale<scalar_t>(
       input_width, output_width, align_corners);
 
   for (int64_t h2 = 0; h2 < output_height; ++h2) {
-    const scalar_t h1r = linear_upsample_compute_source_index<scalar_t>(
-        rheight, h2, align_corners);
+    const scalar_t h1r = area_pixel_compute_source_index<scalar_t>(
+        rheight, h2, align_corners, /*cubic=*/false);
 
     const int64_t h1 = h1r;
     const int64_t h1p = (h1 < input_height - 1) ? 1 : 0;
@@ -58,8 +58,8 @@ static void upsample_bilinear2d_out_frame(
     const scalar_t h0lambda = static_cast<scalar_t>(1.) - h1lambda;
 
     for (int64_t w2 = 0; w2 < output_width; ++w2) {
-      const scalar_t w1r = linear_upsample_compute_source_index<scalar_t>(
-          rwidth, w2, align_corners);
+      const scalar_t w1r = area_pixel_compute_source_index<scalar_t>(
+          rwidth, w2, align_corners, /*cubic=*/false);
 
       const int64_t w1 = w1r;
       const int64_t w1p = (w1 < input_width - 1) ? 1 : 0;
@@ -113,14 +113,14 @@ static void upsample_bilinear2d_backward_out_frame(
     return;
   }
 
-  const scalar_t rheight = linear_upsample_compute_scale<scalar_t>(
+  const scalar_t rheight = area_pixel_compute_scale<scalar_t>(
       input_height, output_height, align_corners);
-  const scalar_t rwidth = linear_upsample_compute_scale<scalar_t>(
+  const scalar_t rwidth = area_pixel_compute_scale<scalar_t>(
       input_width, output_width, align_corners);
 
   for (int64_t h2 = 0; h2 < output_height; ++h2) {
-    const scalar_t h1r = linear_upsample_compute_source_index<scalar_t>(
-        rheight, h2, align_corners);
+    const scalar_t h1r = area_pixel_compute_source_index<scalar_t>(
+        rheight, h2, align_corners, /*cubic=*/false);
 
     const int64_t h1 = h1r;
     const int64_t h1p = (h1 < input_height - 1) ? 1 : 0;
@@ -129,8 +129,8 @@ static void upsample_bilinear2d_backward_out_frame(
     const scalar_t h0lambda = static_cast<scalar_t>(1.) - h1lambda;
 
     for (int64_t w2 = 0; w2 < output_width; ++w2) {
-      const scalar_t w1r = linear_upsample_compute_source_index<scalar_t>(
-          rwidth, w2, align_corners);
+      const scalar_t w1r = area_pixel_compute_source_index<scalar_t>(
+          rwidth, w2, align_corners, /*cubic=*/false);
 
       const int64_t w1 = w1r;
       const int64_t w1p = (w1 < input_width - 1) ? 1 : 0;
@@ -159,7 +159,7 @@ static void upsample_bilinear2d_out_cpu_template(
     const Tensor& input_,
     IntArrayRef output_size,
     bool align_corners) {
-  AT_CHECK(
+  TORCH_CHECK(
       output_size.size() == 2,
       "It is expected output_size equals to 2, but got size ",
       output_size.size());
@@ -192,8 +192,8 @@ static void upsample_bilinear2d_out_cpu_template(
       output_width > 0);
 
   AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), "upsample_bilinear2d", [&] {
-    auto* idata = input.data<scalar_t>();
-    auto* odata = output.data<scalar_t>();
+    auto* idata = input.data_ptr<scalar_t>();
+    auto* odata = output.data_ptr<scalar_t>();
 
     upsample_bilinear2d_out_frame<scalar_t>(
         odata,
@@ -214,12 +214,12 @@ static void upsample_bilinear2d_backward_out_cpu_template(
     IntArrayRef output_size,
     IntArrayRef input_size,
     bool align_corners) {
-  AT_CHECK(
+  TORCH_CHECK(
       output_size.size() == 2,
       "It is expected output_size equals to 2, but got size ",
       output_size.size());
 
-  AT_CHECK(
+  TORCH_CHECK(
       input_size.size() == 4,
       "It is expected input_size equals to 4, but got size ",
       input_size.size());
@@ -249,8 +249,8 @@ static void upsample_bilinear2d_backward_out_cpu_template(
 
   AT_DISPATCH_FLOATING_TYPES_AND_HALF(
       grad_output.scalar_type(), "upsample_bilinear2d_backward", [&] {
-        scalar_t* idata = grad_input.data<scalar_t>();
-        scalar_t* odata = grad_output.data<scalar_t>();
+        scalar_t* idata = grad_input.data_ptr<scalar_t>();
+        scalar_t* odata = grad_output.data_ptr<scalar_t>();
 
         upsample_bilinear2d_backward_out_frame<scalar_t>(
             odata,

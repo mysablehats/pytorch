@@ -12,6 +12,8 @@
 #include <limits>
 #include <tuple>
 #include <THC/THCNumerics.cuh>
+#include <thrust/tuple.h>
+#include <thrust/pair.h>
 
 
 namespace at { namespace native {
@@ -27,14 +29,14 @@ template <typename scalar_t>
 void std_var_kernel_impl(TensorIterator& iter, bool unbiased, bool take_sqrt) {
   // reducing unrolling factor to 2 for welford kernel
   // This is necessary to lower register usage that leads to register spills.
-  gpu_reduce_kernel<scalar_t, scalar_t, 2>(iter, WelfordOps<scalar_t, scalar_t, int32_t, float> { unbiased, take_sqrt }, WelfordData<scalar_t, int32_t, float> {});
+  gpu_reduce_kernel<scalar_t, scalar_t, 2>(iter, WelfordOps<scalar_t, scalar_t, int32_t, float, thrust::tuple<scalar_t, scalar_t>> { unbiased, take_sqrt }, WelfordData<scalar_t, int32_t, float> {});
 }
 
 template <>
 void std_var_kernel_impl<at::Half>(TensorIterator& iter, bool unbiased, bool take_sqrt) {
   // reducing unrolling factor to 2 for welford kernel
   // This is necessary to lower register usage that leads to register spills.
-  gpu_reduce_kernel<at::Half, at::Half, 2>(iter, WelfordOps<at::Half, float, int32_t, float> { unbiased, take_sqrt }, WelfordData<float, int32_t, float> {});
+  gpu_reduce_kernel<at::Half, at::Half, 2>(iter, WelfordOps<at::Half, float, int32_t, float, thrust::tuple<at::Half, at::Half>> { unbiased, take_sqrt }, WelfordData<float, int32_t, float> {});
 }
 
 template <typename scalar_t, typename acc_t=scalar_t>
@@ -59,7 +61,7 @@ void mean_kernel_impl(TensorIterator& iter) {
 template <typename scalar_t, typename acc_t=scalar_t, typename out_t=scalar_t>
 void norm_kernel_cuda_impl(TensorIterator& iter, Scalar val) {
   float p;
-  if (val.isIntegral()) {
+  if (val.isIntegral(false)) {
      p = val.to<int64_t>();
   } else if (val.isFloatingPoint()) {
      p = val.to<acc_t>();
@@ -87,7 +89,7 @@ static void sum_kernel_cuda(TensorIterator& iter) {
     // type promotion that does cast and reduction in a single kernel
     return sum_kernel_impl<at::Half, float, float>(iter);
   }
-  AT_DISPATCH_ALL_TYPES(iter.dtype(), "sum_cuda", [&]() {
+  AT_DISPATCH_ALL_TYPES_AND(ScalarType::Bool, iter.dtype(), "sum_cuda", [&]() {
     sum_kernel_impl<scalar_t>(iter);
   });
 }
@@ -167,6 +169,24 @@ void min_values_kernel_cuda(TensorIterator& iter) {
   });
 }
 
+void argmax_kernel_cuda(TensorIterator& iter) {
+  AT_DISPATCH_ALL_TYPES(iter.dtype(1), "argmax_cuda", [&]() {
+    gpu_reduce_kernel<scalar_t, int64_t>(
+      iter,
+      ArgMaxOps<scalar_t>{},
+      thrust::pair<scalar_t, int64_t>(at::numeric_limits<scalar_t>::lower_bound(), 0));
+  });
+}
+
+void argmin_kernel_cuda(TensorIterator& iter) {
+  AT_DISPATCH_ALL_TYPES(iter.dtype(1), "argmin_cuda", [&]() {
+    gpu_reduce_kernel<scalar_t, int64_t>(
+      iter,
+      ArgMinOps<scalar_t>{},
+      thrust::pair<scalar_t, int64_t>(at::numeric_limits<scalar_t>::upper_bound(), 0));
+  });
+}
+
 REGISTER_DISPATCH(std_var_stub, &std_var_kernel_cuda);
 REGISTER_DISPATCH(sum_stub, &sum_kernel_cuda);
 REGISTER_DISPATCH(prod_stub, &prod_kernel_cuda);
@@ -176,5 +196,7 @@ REGISTER_DISPATCH(and_stub, &and_kernel_cuda);
 REGISTER_DISPATCH(or_stub, &or_kernel_cuda);
 REGISTER_DISPATCH(max_values_stub, &max_values_kernel_cuda);
 REGISTER_DISPATCH(min_values_stub, &min_values_kernel_cuda);
+REGISTER_DISPATCH(argmax_stub, &argmax_kernel_cuda);
+REGISTER_DISPATCH(argmin_stub, &argmin_kernel_cuda);
 
 }} // namespace at::native

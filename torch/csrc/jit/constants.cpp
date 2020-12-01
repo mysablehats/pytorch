@@ -3,15 +3,36 @@
 #include <torch/csrc/autograd/variable.h>
 #include <torch/csrc/jit/custom_operator.h>
 #include <torch/csrc/jit/operator.h>
+#include <torch/csrc/jit/ir.h>
 
 namespace torch {
 namespace jit {
 
-// IValue -> Constant node
+namespace {
+c10::OperatorOptions aliasAnalysisInternalSpecialCase() {
+  c10::OperatorOptions options;
+  options.setAliasAnalysis(AliasAnalysisKind::INTERNAL_SPECIAL_CASE);
+  return options;
+}
+} // namespace
+
 Value* insertConstant(
     Graph& g,
     const IValue& val,
-    const c10::TypePtr& result_type,
+    c10::optional<SourceRange> loc,
+    c10::optional<ScopePtr> scope) {
+  auto value = tryInsertConstant(g, val, loc, scope);
+  if (value) {
+    return *value;
+  }
+  throw constant_not_supported_error(
+      "Unsupported value kind: " + val.tagKind());
+}
+
+// IValue -> Constant node
+c10::optional<Value*> tryInsertConstant(
+    Graph& g,
+    const IValue& val,
     c10::optional<SourceRange> loc,
     c10::optional<ScopePtr> scope) {
   Node* n = g.create(prim::Constant);
@@ -19,7 +40,7 @@ Value* insertConstant(
     at::Tensor ref = val.toTensor();
     if (!ref.defined()) {
       n->destroy();
-      return g.insertNode(g.createNone(TensorType::get()))->output();
+      return g.insertNode(g.createNone())->output();
     }
     // TODO: fix all cases where we are not passing in a variable,
     // and then change this to an AT_ASSERT
@@ -41,17 +62,17 @@ Value* insertConstant(
     n->i_(attr::value, val.toBool());
     n->output()->setType(BoolType::get());
   } else if (val.isBoolList()) {
-    auto bool_list = val.toBoolList()->elements();
+    auto bool_list = val.toBoolList();
     n->is_(
         attr::value, std::vector<int64_t>(bool_list.begin(), bool_list.end()));
     n->output()->setType(ListType::ofBools());
   } else if (val.isIntList()) {
-    n->is_(attr::value, val.toIntList()->elements());
+    n->is_(attr::value, val.toIntListRef().vec());
     n->output()->setType(ListType::ofInts());
   } else if (val.isTensorList()) {
     n->ts_(
         attr::value,
-        fmap(val.toTensorList()->elements(), [](const at::Tensor& t) {
+        fmap(val.toTensorListRef(), [](const at::Tensor& t) {
           AT_ASSERT(t.is_variable() && !t.requires_grad());
           return t;
         }));
@@ -68,21 +89,12 @@ Value* insertConstant(
     n->output()->setType(NoneType::get());
   } else {
     n->destroy();
-    throw constant_not_supported_error(
-        "Unsupported value kind: " + val.tagKind());
+    return c10::nullopt;
   }
   if (loc)
-    n->setSourceLocation(std::make_shared<SourceRange>(*loc));
+    n->setSourceRange(*loc);
   if (scope)
     n->setScope(*scope);
-  if (result_type) {
-    auto inferred_type = n->output()->type();
-    // Retain more type information in case of tensor constant
-    if (!(inferred_type->isSubtypeOf(TensorType::get()) &&
-          result_type->isSubtypeOf(inferred_type))) {
-      n->output()->setType(result_type);
-    }
-  }
   return g.insertNode(n)->output();
 }
 
@@ -165,7 +177,8 @@ RegisterOperators reg({
             ss << "constant literal not supported for: " << type->str();
             throw std::runtime_error(ss.str());
           }
-        }),
+        },
+        aliasAnalysisInternalSpecialCase()),
 });
 
 c10::optional<IValue> toIValue(const Value* v) {

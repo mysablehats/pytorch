@@ -67,7 +67,7 @@ struct dst_idx_to_src_functor : public thrust::unary_function<int64_t, scalar_t>
 
   dst_idx_to_src_functor(const Tensor& batched_complex_signal)
     : signal_ndim(batched_complex_signal.dim() - 1),
-      data(batched_complex_signal.data<scalar_t>()) {
+      data(batched_complex_signal.data_ptr<scalar_t>()) {
     for (int64_t i = 0; i < signal_ndim; i++) {
       sizes[i] = batched_complex_signal.size(i);
       strides[i] = batched_complex_signal.stride(i);
@@ -125,7 +125,7 @@ static void _fft_fill_with_conjugate_symmetry_(Tensor& input,
 
     dst_idx_iterator dst_idxs(counter(0), cnt_to_dst_idx_functor(size_last_dim, last_dim_start_slice));
 
-    auto data = device_ptr(input.data<scalar_t>());
+    auto data = device_ptr(input.data_ptr<scalar_t>());
     dst_iterator dsts(data, dst_idxs);
     src_iterator srcs(dst_idxs, dst_idx_to_src_functor<scalar_t>(input));
     thrust::copy_n(policy, srcs, n, dsts);
@@ -286,7 +286,7 @@ CuFFTParamsLRUCache &cufft_get_plan_cache(int64_t device_index) {
 namespace detail {
 
 int64_t cufft_get_plan_cache_max_size_impl(int64_t device_index) {
-  AT_CHECK(0 <= device_index && device_index < at::detail::getCUDAHooks().getNumGPUs(),
+  TORCH_CHECK(0 <= device_index && device_index < at::detail::getCUDAHooks().getNumGPUs(),
     "cufft_get_plan_cache_max_size: expected 0 <= device_index < ",
     at::detail::getCUDAHooks().getNumGPUs(), "], but got device_index=",
     device_index);
@@ -294,7 +294,7 @@ int64_t cufft_get_plan_cache_max_size_impl(int64_t device_index) {
 }
 
 void cufft_set_plan_cache_max_size_impl(int64_t device_index, int64_t max_size) {
-  AT_CHECK(0 <= device_index && device_index < at::detail::getCUDAHooks().getNumGPUs(),
+  TORCH_CHECK(0 <= device_index && device_index < at::detail::getCUDAHooks().getNumGPUs(),
     "cufft_set_plan_cache_max_size: expected 0 <= device_index < ",
     at::detail::getCUDAHooks().getNumGPUs(), "], but got device_index=",
     device_index);
@@ -302,7 +302,7 @@ void cufft_set_plan_cache_max_size_impl(int64_t device_index, int64_t max_size) 
 }
 
 int64_t cufft_get_plan_cache_size_impl(int64_t device_index) {
-  AT_CHECK(0 <= device_index && device_index < at::detail::getCUDAHooks().getNumGPUs(),
+  TORCH_CHECK(0 <= device_index && device_index < at::detail::getCUDAHooks().getNumGPUs(),
     "cufft_get_plan_cache_size: expected 0 <= device_index < ",
     at::detail::getCUDAHooks().getNumGPUs(), "], but got device_index=",
     device_index);
@@ -310,7 +310,7 @@ int64_t cufft_get_plan_cache_size_impl(int64_t device_index) {
 }
 
 void cufft_clear_plan_cache_impl(int64_t device_index) {
-  AT_CHECK(0 <= device_index && device_index < at::detail::getCUDAHooks().getNumGPUs(),
+  TORCH_CHECK(0 <= device_index && device_index < at::detail::getCUDAHooks().getNumGPUs(),
     "cufft_clear_plan_cache: expected 0 <= device_index < ",
     at::detail::getCUDAHooks().getNumGPUs(), "], but got device_index=",
     device_index);

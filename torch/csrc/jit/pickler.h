@@ -1,7 +1,10 @@
+#pragma once
+
 #include <string>
 #include <vector>
 
 #include <ATen/core/ivalue.h>
+#include <ATen/core/jit_type.h>
 #include <c10/util/ArrayRef.h>
 #include <torch/csrc/utils/disallow_copy.h>
 
@@ -9,7 +12,7 @@ namespace torch {
 namespace jit {
 
 // See Python's pickletools.py for a detailed description of each of these codes
-enum class OpCode : char {
+enum class PickleOpCode : char {
   MARK = '(',
   STOP = '.',
   POP = '0',
@@ -83,107 +86,153 @@ enum class OpCode : char {
   FRAME = '\x95'
 };
 
-enum PicklerClass : uint8_t { TENSOR = 0, INTLIST = 1 };
+enum PicklerClass : uint8_t {
+  // A reference to the tensor table
+  TENSOR = 0,
+  // List[int]
+  INTLIST = 1,
+  // List[Tensor]
+  TENSORLIST = 2,
+  // List[float]
+  DOUBLELIST = 3,
+  // List[bool]
+  BOOLLIST = 4
+};
 
 using ::c10::IValue;
+
+struct WriteableTensorData {
+  const char* data() const {
+    return static_cast<const char*>(tensor_.storage().data());
+  }
+  size_t sizeInBytes() const {
+    return size_;
+  }
+  size_t numel() const {
+    return tensor_.storage().numel();
+  }
+
+ private:
+  friend WriteableTensorData getWriteableTensorData(const at::Tensor& tensor);
+  at::Tensor tensor_;
+  uint64_t size_;
+};
 
 class Pickler {
   TH_DISALLOW_COPY_AND_ASSIGN(Pickler);
 
  public:
-  Pickler(std::vector<at::Tensor>* tensor_table)
-      : tensor_table_(tensor_table) {}
+  Pickler(
+      std::function<void(const char*, size_t)> writer,
+      std::vector<at::Tensor>* tensor_table)
+      : writer_(writer), tensor_table_(tensor_table) {}
 
-  const std::vector<char>& stack();
-  void start();
-  void finish();
-  void addIValue(const IValue& ivalue);
+  // Push protocol onto the stack
+  void protocol();
+
+  // Push STOP PickleOpCode onto the stack
+  void stop();
+
+  void pushIValue(const IValue& ivalue);
+
+  void startTuple();
+  void endTuple();
+
+  const std::vector<WriteableTensorData>& tensorData() {
+    return tensor_data_;
+  }
+  void pushEmptyDict();
+  void pushDict(const IValue& ivalue);
+  void pushInt(int64_t value);
+  void pushLong(const std::string& data);
 
  private:
-  void pushBinGet(uint32_t memo_id);
-  void pushMemoizedString(const IValue& ivalue);
-  void pushString(const std::string& string);
-  void pushTensor(const IValue& ivalue);
-  void pushDouble(const IValue& ivalue);
-  void pushMemoization(const void* item);
-  void pushMemoization(const IValue& ivalue);
-  void pushList(const IValue& ivalue);
+  void pushIValueImpl(const IValue& ivalue);
+  void pushDouble(double value);
+  void pushGenericList(const IValue& ivalue);
   void pushIntList(const IValue& ivalue);
+  void pushList(const IValue& ivalue);
+  void pushTensor(const IValue& ivalue);
+  void pushTensorReference(const IValue& ivalue);
+  void pushLiteralTensor(const IValue& ivalue);
   void pushTuple(const IValue& ivalue);
-  void pushDict(const IValue& ivalue);
+  void pushString(const std::string& string);
+  // unmemoized version
+  void pushStringImpl(const std::string& string);
+  void pushStorageOfTensor(const at::Tensor& tensor);
+
+  void pushBinGet(uint32_t memo_id);
   void pushClass(PicklerClass cls);
-  void pushInt(const IValue& ivalue);
+  void pushSpecializedList(
+      const IValue& ivalue,
+      PicklerClass cls,
+      const std::function<void(const IValue&)>& item_pusher);
+  void pushGlobal(
+      const std::string& module_name,
+      const std::string& class_name);
+  // raw string data is appended directly to the byte stream
+  void pushBytes(const std::string& string);
+  void pushTensorData(const at::Tensor& tensor);
+
+  // Add a BINPUT op and return the memoization id used
+  size_t pushNextBinPut();
+
   const void* getPointer(const IValue& ivalue);
 
   // These convert values to bytes and add them to the stack (NB: since T is to
   // the left of a '::', its type cannot be deduced by the compiler so one must
   // explicitly instantiate the template, i.e. push<int>(int) works, push(int)
   // does not)
-  template<typename T>
+  template <typename T>
   void push(typename std::common_type<T>::type value) {
     const char* begin = reinterpret_cast<const char*>(&value);
-    stack_.insert(stack_.end(), begin, begin + sizeof(T));
+    writer_(begin, sizeof(T));
   }
+
+  // Stream to write binary data to
+  std::function<void(const char*, size_t)> writer_;
 
   // Stack of opcodes/data
   std::vector<char> stack_;
 
-  // Memoization of IValues that have been written (index in table is used for
-  // BINPUT opcodes) to enable shared references
-  std::unordered_map<const void*, uint32_t> memo_map_;
-
-  // External table of tensors to serialize
+  // External table of tensors to serialize. If this is missing, then tensors
+  // are serialized directly into the pickle
   std::vector<at::Tensor>* tensor_table_;
 
   // TODO: only use this if necessary (add a pass to find all shared ivalues,
   // and only memoize those)
-  uint32_t memo_id = 0;
+  uint32_t memo_id_ = 0;
+
+  // Memoization of IValues that have been written (index in table is used for
+  // BINPUT opcodes) to enable shared references
+  std::unordered_map<const void*, uint32_t> memoized_ivalue_map_;
+
+  // because we de-dup ivalues based on their raw pointer address in the above
+  // map we need to keep all the memoized values alive during the pickle.
+  // Otherwise, it is possible that a raw address gets reused for another
+  // object, and we will alias it to the old object at that address.
+  std::vector<IValue> memoized_ivalues_;
+
+  // List of tensor storages to serialize in the same binary as the pickle data
+  // similar to ivalues, they are memoized using BINPUT
+  std::vector<WriteableTensorData> tensor_data_;
+  std::unordered_map<const void*, uint32_t> memoized_storage_map_;
+
+  std::unordered_map<std::string, uint32_t> memoized_globals_map_;
+  std::unordered_map<std::string, uint32_t> memoized_strings_map_;
 };
 
-class Unpickler {
-  TH_DISALLOW_COPY_AND_ASSIGN(Unpickler);
+// returns a (tensor, record_size) for a tensor, converting it to a CPU tensor
+// if necessary
+WriteableTensorData getWriteableTensorData(const at::Tensor& tensor);
 
- public:
-  Unpickler(
-      void* data,
-      size_t size,
-      const std::vector<at::Tensor>* tensor_table)
-      : bytes_(static_cast<const uint8_t*>(data)),
-        end_ptr_(bytes_ + size),
-        tensor_table_(tensor_table),
-        last_opcode_(OpCode::STOP) {}
+// return the value of the tensor's storage pointer
+uint64_t getStorageKey(const at::Tensor& tensor);
 
-  std::vector<IValue> parse_ivalue_list();
-
- private:
-  // No arguments ensures that a template arugment must be specified
-  // so that the number of bytes read / type read is explicit
-  template <typename T>
-  T read() {
-    AT_CHECK(
-        bytes_ + sizeof(T) <= end_ptr_,
-        "Unpickler overran buffer while reading a value");
-    T item;
-    std::memcpy(&item, bytes_, sizeof(T));
-    bytes_ += sizeof(T);
-    return item;
-  }
-
-  double readFloat();
-  void run();
-  OpCode readInstruction();
-  std::string readString();
-  OpCode readOpCode();
-  void readList();
-
-  std::vector<IValue> stack_;
-  std::vector<IValue> memo_table_;
-  std::vector<size_t> marks_;
-  const uint8_t* bytes_;
-  const uint8_t* end_ptr_;
-  const std::vector<at::Tensor>* tensor_table_;
-  OpCode last_opcode_;
-};
+// if the cls has __getstate__/__setstate__
+// assert they have the right schema and return true,
+// otherwise return false
+bool checkHasValidSetGetState(const std::shared_ptr<c10::ClassType>& cls);
 
 } // namespace jit
 } // namespace torch

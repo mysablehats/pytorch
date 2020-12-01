@@ -12,15 +12,19 @@ import contextlib
 import platform
 import ctypes
 import os
+import sys
 import torch
 import traceback
 import warnings
+import threading
 from torch._six import raise_from
 from subprocess import Popen, PIPE
 from multiprocessing.util import register_after_fork as _register_after_fork
 from ._utils import _get_device_index
 
 _initialized = False
+_tls = threading.local()
+_initialization_lock = threading.Lock()
 _queued_calls = []  # don't invoke these until initialization occurs
 _in_bad_fork = False  # this global is also used in torch.manual_seed
 _original_pid = False
@@ -28,7 +32,23 @@ _cudart = None
 
 
 def find_cuda_windows_lib():
-    proc = Popen(['where', 'cudart64*.dll'], stdout=PIPE, stderr=PIPE, stdin=PIPE)
+    # Override the default search process
+    # Fixes https://github.com/pytorch/pytorch/issues/20202
+    # The libary selection will be done in these directories one by one
+    # 1. [Package Root]\Lib
+    #    That's where our libraries are in, which should be loaded first.
+    # 2. [Python Root]\Library\bin
+    #    That's where `cudatoolkit` store the cuda libraries.
+    # 3. Default directories
+    #    That is stored in the environment variable `PATH`.
+    test_env = os.environ.copy()
+    old_path = test_env['PATH']
+    py_dll_path = os.path.join(sys.exec_prefix, 'Library', 'bin')
+    th_dll_path = os.path.join(os.path.dirname(
+        os.path.dirname(__file__)), 'lib')
+    test_env['PATH'] = ';'.join([th_dll_path, py_dll_path, old_path])
+    proc = Popen(['where', 'cudart64*.dll'], stdout=PIPE,
+                 stderr=PIPE, stdin=PIPE, env=test_env)
     out, err = proc.communicate()
     out = out.decode().strip()
     if len(out) > 0:
@@ -93,8 +113,8 @@ of the CUDA driver.""".format(str(torch._C._cuda_getDriverVersion())))
 
 def _check_capability():
     incorrect_binary_warn = """
-    Found GPU%d %s which requires CUDA_VERSION >= %d for
-     optimal performance and fast startup time, but your PyTorch was compiled
+    Found GPU%d %s which requires CUDA_VERSION >= %d to
+     work properly, but your PyTorch was compiled
      with CUDA_VERSION %d. Please install the correct PyTorch binary
      using instructions from https://pytorch.org
     """
@@ -109,13 +129,12 @@ def _check_capability():
     for d in range(device_count()):
         capability = get_device_capability(d)
         major = capability[0]
+        minor = capability[1]
         name = get_device_name(d)
-        if CUDA_VERSION < 8000 and major >= 6:
-            warnings.warn(incorrect_binary_warn % (d, name, 8000, CUDA_VERSION))
-        elif CUDA_VERSION < 9000 and major >= 7:
-            warnings.warn(incorrect_binary_warn % (d, name, 9000, CUDA_VERSION))
-        elif capability == (3, 0) or major < 3:
+        if capability == (3, 0) or major < 3:
             warnings.warn(old_gpu_warn % (d, name, major, capability[1]))
+        elif CUDA_VERSION <= 9000 and major >= 7 and minor >= 5:
+            warnings.warn(incorrect_binary_warn % (d, name, 10000, CUDA_VERSION))
 
 
 def _lazy_call(callable):
@@ -147,34 +166,50 @@ def init():
 
 def _lazy_init():
     global _initialized, _cudart, _original_pid, _queued_calls
-    if _initialized:
+    if _initialized or hasattr(_tls, 'is_initializing'):
         return
-    if _in_bad_fork:
-        from sys import version_info
-        if version_info < (3, 4):
-            msg = ("To use CUDA with multiprocessing, you must use Python "
-                   "3.4+ and the 'spawn' start method")
-        else:
-            msg = ("To use CUDA with multiprocessing, you must use the "
-                   "'spawn' start method")
-        raise RuntimeError(
-            "Cannot re-initialize CUDA in forked subprocess. " + msg)
-    _check_driver()
-    torch._C._cuda_init()
-    _cudart = _load_cudart()
-    _cudart.cudaGetErrorName.restype = ctypes.c_char_p
-    _cudart.cudaGetErrorString.restype = ctypes.c_char_p
-    _original_pid = os.getpid()
-    _initialized = True
-    # Important to do this after _initialized, since some queued calls
-    # may themselves call _lazy_init()
-    for queued_call, orig_traceback in _queued_calls:
+    with _initialization_lock:
+        # We be double-checked locking, boys!  This is OK because
+        # the above test was GIL protected anyway.  The inner test
+        # is for when a thread blocked on some other thread which was
+        # doing the initialization; when they get the lock, they will
+        # find there is nothing left to do.
+        if _initialized:
+            return
+        # It is important to prevent other threads from entering _lazy_init
+        # immediately, while we are still guaranteed to have the GIL, because some
+        # of the C calls we make below will release the GIL
+        if _in_bad_fork:
+            from sys import version_info
+            if version_info < (3, 4):
+                msg = ("To use CUDA with multiprocessing, you must use Python "
+                       "3.4+ and the 'spawn' start method")
+            else:
+                msg = ("To use CUDA with multiprocessing, you must use the "
+                       "'spawn' start method")
+            raise RuntimeError(
+                "Cannot re-initialize CUDA in forked subprocess. " + msg)
+        _check_driver()
+        torch._C._cuda_init()
+        _cudart = _load_cudart()
+        _cudart.cudaGetErrorName.restype = ctypes.c_char_p
+        _cudart.cudaGetErrorString.restype = ctypes.c_char_p
+        _original_pid = os.getpid()
+        # Some of the queued calls may reentrantly call _lazy_init();
+        # we need to just return without initializing in that case.
+        # However, we must not let any *other* threads in!
+        _tls.is_initializing = True
         try:
-            queued_call()
-        except Exception as e:
-            msg = ("CUDA call failed lazily at initialization with error: {}\n\n"
-                   "CUDA call was originally invoked at:\n\n{}").format(str(e), orig_traceback)
-            raise_from(DeferredCudaCallError(msg), e)
+            for queued_call, orig_traceback in _queued_calls:
+                try:
+                    queued_call()
+                except Exception as e:
+                    msg = ("CUDA call failed lazily at initialization with error: {}\n\n"
+                           "CUDA call was originally invoked at:\n\n{}").format(str(e), orig_traceback)
+                    raise_from(DeferredCudaCallError(msg), e)
+        finally:
+            delattr(_tls, 'is_initializing')
+        _initialized = True
 
 
 def _after_fork(arg):
@@ -183,7 +218,7 @@ def _after_fork(arg):
         _initialized = False
         _in_bad_fork = True
         _CudaBase.__new__ = _lazy_new
-
+        torch._C._cuda_set_run_yet_variable_to_false()
 
 _register_after_fork(_after_fork, _after_fork)
 
@@ -271,7 +306,7 @@ def get_device_name(device=None):
     Arguments:
         device (torch.device or int, optional): device for which to return the
             name. This function is a no-op if this argument is a negative
-            integer. Uses the current device, given by :meth:`~torch.cuda.current_device`,
+            integer. It uses the current device, given by :func:`~torch.cuda.current_device`,
             if :attr:`device` is ``None`` (default).
     """
     return get_device_properties(device).name
@@ -283,8 +318,8 @@ def get_device_capability(device=None):
     Arguments:
         device (torch.device or int, optional): device for which to return the
             device capability. This function is a no-op if this argument is
-            a negative integer. Uses the current device, given by
-            :meth:`~torch.cuda.current_device`, if :attr:`device` is ``None``
+            a negative integer. It uses the current device, given by
+            :func:`~torch.cuda.current_device`, if :attr:`device` is ``None``
             (default).
 
     Returns:
@@ -339,7 +374,7 @@ def stream(stream):
 
 
 def device_count():
-    """Returns the number of GPUs available."""
+    r"""Returns the number of GPUs available."""
     if is_available():
         return torch._C._cuda_getDeviceCount()
     else:
@@ -352,10 +387,17 @@ def current_device():
     return torch._C._cuda_getDevice()
 
 
-def synchronize():
-    r"""Waits for all kernels in all streams on current device to complete."""
+def synchronize(device=None):
+    r"""Waits for all kernels in all streams on a CUDA device to complete.
+
+    Arguments:
+        device (torch.device or int, optional): device for which to synchronize.
+            It uses the current device, given by :func:`~torch.cuda.current_device`,
+            if :attr:`device` is ``None`` (default).
+    """
     _lazy_init()
-    return torch._C._cuda_synchronize()
+    with torch.cuda.device(device):
+        return torch._C._cuda_synchronize()
 
 
 def ipc_collect():
@@ -377,7 +419,7 @@ def current_stream(device=None):
     Arguments:
         device (torch.device or int, optional): selected device. Returns
             the currently selected :class:`Stream` for the current device, given
-            by :meth:`~torch.cuda.current_device`, if :attr:`device` is ``None``
+            by :func:`~torch.cuda.current_device`, if :attr:`device` is ``None``
             (default).
     """
     _lazy_init()
@@ -391,7 +433,7 @@ def default_stream(device=None):
     Arguments:
         device (torch.device or int, optional): selected device. Returns
             the default :class:`Stream` for the current device, given by
-            :meth:`~torch.cuda.current_device`, if :attr:`device` is ``None``
+            :func:`~torch.cuda.current_device`, if :attr:`device` is ``None``
             (default).
     """
     _lazy_init()
@@ -411,7 +453,7 @@ def empty_cache():
     `nvidia-smi`.
 
     .. note::
-        :meth:`~torch.cuda.empty_cache` doesn't increase the amount of GPU
+        :func:`~torch.cuda.empty_cache` doesn't increase the amount of GPU
         memory available for PyTorch. See :ref:`cuda-memory-management` for
         more details about GPU memory management.
     """
@@ -425,7 +467,7 @@ def memory_allocated(device=None):
 
     Arguments:
         device (torch.device or int, optional): selected device. Returns
-            statistic for the current device, given by :meth:`~torch.cuda.current_device`,
+            statistic for the current device, given by :func:`~torch.cuda.current_device`,
             if :attr:`device` is ``None`` (default).
 
     .. note::
@@ -450,7 +492,7 @@ def max_memory_allocated(device=None):
 
     Arguments:
         device (torch.device or int, optional): selected device. Returns
-            statistic for the current device, given by :meth:`~torch.cuda.current_device`,
+            statistic for the current device, given by :func:`~torch.cuda.current_device`,
             if :attr:`device` is ``None`` (default).
 
     .. note::
@@ -469,7 +511,7 @@ def reset_max_memory_allocated(device=None):
 
     Arguments:
         device (torch.device or int, optional): selected device. Returns
-            statistic for the current device, given by :meth:`~torch.cuda.current_device`,
+            statistic for the current device, given by :func:`~torch.cuda.current_device`,
             if :attr:`device` is ``None`` (default).
 
     .. note::
@@ -486,7 +528,7 @@ def memory_cached(device=None):
 
     Arguments:
         device (torch.device or int, optional): selected device. Returns
-            statistic for the current device, given by :meth:`~torch.cuda.current_device`,
+            statistic for the current device, given by :func:`~torch.cuda.current_device`,
             if :attr:`device` is ``None`` (default).
 
     .. note::
@@ -509,7 +551,7 @@ def max_memory_cached(device=None):
 
     Arguments:
         device (torch.device or int, optional): selected device. Returns
-            statistic for the current device, given by :meth:`~torch.cuda.current_device`,
+            statistic for the current device, given by :func:`~torch.cuda.current_device`,
             if :attr:`device` is ``None`` (default).
 
     .. note::
@@ -528,7 +570,7 @@ def reset_max_memory_cached(device=None):
 
     Arguments:
         device (torch.device or int, optional): selected device. Returns
-            statistic for the current device, given by :meth:`~torch.cuda.current_device`,
+            statistic for the current device, given by :func:`~torch.cuda.current_device`,
             if :attr:`device` is ``None`` (default).
 
     .. note::
@@ -573,7 +615,7 @@ def _dummy_type(name):
 
 if not hasattr(torch._C, 'CudaDoubleStorageBase'):
     # Define dummy base classes
-    for t in ['Double', 'Float', 'Long', 'Int', 'Short', 'Char', 'Byte', 'Half', 'Bool']:
+    for t in ['Double', 'Float', 'Long', 'Int', 'Short', 'Char', 'Byte', 'Half', 'Bool', 'BFloat16']:
         storage_name = 'Cuda{0}StorageBase'.format(t)
         tensor_name = 'Cuda{0}TensorBase'.format(t)
 
@@ -638,6 +680,10 @@ class HalfStorage(_CudaBase, torch._C.CudaHalfStorageBase, _StorageBase):
 class BoolStorage(_CudaBase, torch._C.CudaBoolStorageBase, _StorageBase):
     pass
 
+
+class BFloat16Storage(_CudaBase, torch._C.CudaBFloat16StorageBase, _StorageBase):
+    pass
+
 torch._storage_classes.add(DoubleStorage)
 torch._storage_classes.add(FloatStorage)
 torch._storage_classes.add(LongStorage)
@@ -647,6 +693,7 @@ torch._storage_classes.add(CharStorage)
 torch._storage_classes.add(ByteStorage)
 torch._storage_classes.add(HalfStorage)
 torch._storage_classes.add(BoolStorage)
+torch._storage_classes.add(BFloat16Storage)
 
 from . import sparse  # noqa: F401
 from . import profiler  # noqa: F401

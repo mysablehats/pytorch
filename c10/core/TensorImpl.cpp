@@ -2,6 +2,7 @@
 
 #include <c10/core/Backend.h>
 #include <c10/core/WrapDimMinimal.h>
+#include <c10/core/impl/LocalTensorTypeSet.h>
 #include <c10/util/Optional.h>
 
 C10_DEFINE_bool(
@@ -16,6 +17,16 @@ C10_DEFINE_int64(
     "tensor sizes is bigger than this then tensor will be reset.");
 
 namespace c10 {
+
+const char * const TensorImpl::err_msg_tensor_metadata_change_not_allowed =
+    "is not allowed on a Tensor created from .data or .detach().\n"
+    "If your intent is to change the metadata of a Tensor (such as sizes / strides / storage / storage_offset)\n"
+    "without autograd tracking the change, remove the .data / .detach() call and wrap the change in a `with torch.no_grad():` block.\n"
+    "For example, change:\n"
+    "    x.data.set_(y)\n"
+    "to:\n"
+    "    with torch.no_grad():\n"
+    "        x.set_(y)";
 
 at::Tensor& TensorImpl::grad() {
   if (autograd_meta()) {
@@ -33,13 +44,13 @@ const at::Tensor& TensorImpl::grad() const {
   }
 }
 
-TensorImpl::TensorImpl(Storage&& storage, TensorTypeId type_id)
-    : TensorImpl(std::move(storage), type_id, storage.dtype(), storage.device()) {}
+TensorImpl::TensorImpl(Storage&& storage, TensorTypeSet type_set)
+    : TensorImpl(std::move(storage), type_set, storage.dtype(), storage.device()) {}
 
-TensorImpl::TensorImpl(TensorTypeId type_id, const caffe2::TypeMeta& data_type, c10::optional<c10::Device> device_opt)
-    : TensorImpl({}, type_id, data_type, std::move(device_opt)) {}
+TensorImpl::TensorImpl(TensorTypeSet type_set, const caffe2::TypeMeta& data_type, c10::optional<c10::Device> device_opt)
+    : TensorImpl({}, type_set, data_type, std::move(device_opt)) {}
 
-TensorImpl::TensorImpl(Storage&& storage, TensorTypeId type_id, const caffe2::TypeMeta& data_type,
+TensorImpl::TensorImpl(Storage&& storage, TensorTypeSet type_set, const caffe2::TypeMeta& data_type,
                        c10::optional<c10::Device> device_opt)
     : storage_(std::move(storage)),
       sizes_{0},
@@ -47,9 +58,13 @@ TensorImpl::TensorImpl(Storage&& storage, TensorTypeId type_id, const caffe2::Ty
       numel_(0),
       data_type_(data_type),
       device_opt_(device_opt),
-      type_id_(type_id) {
-  AT_ASSERT(type_id == UndefinedTensorId() || data_type.id() ==  caffe2::TypeIdentifier::uninitialized() ||
-            device_opt_.has_value());
+      type_set_(type_set.remove(TensorTypeId::VariableTensorId)) {
+  if (!type_set.empty()) {
+    AT_ASSERT(data_type.id() ==  caffe2::TypeIdentifier::uninitialized() ||
+              device_opt_.has_value());
+    // UndefinedTensorImpl is a singleton, so we skip logging it
+    C10_LOG_API_USAGE_ONCE("tensor.create");
+  }
   // we would also like to check that non-cpu devices have an index, but some Caffe2 operators create
   // Storages with default devices.
   strides_.push_back(1);
@@ -81,7 +96,42 @@ bool TensorImpl::compute_contiguous() const {
   return is_contiguous;
 }
 
+bool TensorImpl::compute_channels_last_contiguous() const {
+  if (dim() == 4) {
+    int64_t expected = 1;
+    for (auto& d : {1, 3, 2, 0}) {
+      if (size(d) != 1) {
+        if (stride(d) == expected) {
+          expected *= size(d);
+        } else {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+  return false;
+}
+
+bool TensorImpl::compute_strides_like_channels_last() const {
+  if (dim() == 4) {
+    int64_t min = 0;
+    for (auto& d : {1, 3, 2, 0}) {
+      if (size(d) != 1) {
+        if (stride(d) > min) {
+          min = stride(d);
+        } else {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+  return false;
+}
+
 void TensorImpl::release_resources() {
+  autograd_meta_.reset();
   if (storage_) {
     storage_ = {};
   }
@@ -113,6 +163,16 @@ bool TensorImpl::has_storage() const {
   return storage_;
 }
 
+bool TensorImpl::is_contiguous(at::MemoryFormat memory_format) const {
+#ifdef DEBUG
+  AT_ASSERT(compute_contiguous() == is_contiguous_);
+#endif
+  if (memory_format == at::MemoryFormat::ChannelsLast) {
+      return is_channels_last_contiguous_;
+  }
+  return is_contiguous_;
+}
+
 const Storage& TensorImpl::storage() const {
   return storage_;
 }
@@ -134,5 +194,13 @@ at::DataPtr PlacementDeleteContext::makeDataPtr(
 }
 
 AutogradMetaInterface::~AutogradMetaInterface() {}
+
+bool NonVariableTypeMode::is_enabled() {
+  return !impl::tls_variable_is_enabled();
+}
+
+void NonVariableTypeMode::set_enabled(bool enabled) {
+  impl::tls_variable_set_enabled(!enabled);
+}
 
 } // namespace c10

@@ -2,6 +2,7 @@
 
 #include <c10/util/Exception.h>
 #include <torch/csrc/jit/constants.h>
+#include <torch/csrc/jit/function.h>
 #include <torch/csrc/jit/operator.h>
 #include <torch/csrc/jit/passes/python_print.h>
 #include <torch/csrc/jit/script/schema_matching.h>
@@ -10,7 +11,6 @@
 #include <iostream>
 #include <set>
 #include <sstream>
-#include <stack>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -27,18 +27,15 @@ void printQuotedString(std::ostream& stmt, const std::string& str);
 static constexpr topo_position_t kLowerBound = INT64_MIN;
 static constexpr topo_position_t kUpperBound = INT64_MAX;
 static constexpr topo_position_t kMidPoint = 0;
+
 // How far away to space nodes that are appended to the graph.
 // should be 2^n, where:
 //   - n is the maximum number of repeated insertions without a re-index
 //   - 2^(64-n) is the maximum number of appends to the end without reindex
 static constexpr topo_position_t kAppendInterval = 1099511627776ULL /* 2^40 */;
 
-// Sigh, see
-// https://stackoverflow.com/questions/8016780/undefined-reference-to-static-constexpr-char
-constexpr Symbol PythonOp::Kind;
-
 static void printValueRef(std::ostream& out, const Value* n) {
-  out << "%" << n->uniqueName();
+  out << "%" << n->debugName();
 }
 
 // NB: This overload will become ambiguous with the one Caffe2 provides in its
@@ -181,8 +178,8 @@ void Node::printAttrValue(std::ostream& out, const Symbol& name) const {
   }
 }
 
-void Node::printAttributes(std::ostream& out, bool ignore_subgraph = false)
-    const {
+void Node::printAttributes(std::ostream &out,
+                           bool ignore_subgraph = false) const {
   out << "[";
   auto names = attributeNames();
   int i = 0;
@@ -204,6 +201,13 @@ void Node::printAttributes(std::ostream& out, bool ignore_subgraph = false)
   out << "]";
 }
 
+SourceRange Node::sourceRange() const {
+  if (source_range_) {
+    return *source_range_;
+  }
+  return SourceRange();
+}
+
 static std::ostream& indent(std::ostream& out, size_t level) {
   for (size_t i = 0; i < level; ++i) {
     out << "  ";
@@ -211,10 +215,10 @@ static std::ostream& indent(std::ostream& out, size_t level) {
   return out;
 }
 
-std::ostream& Node::print(
-    std::ostream& out,
-    size_t level,
-    std::vector<const Node*>* groups) const {
+std::ostream &Node::print(std::ostream &out, size_t level,
+                          std::vector<const Node *> *groups,
+                          bool print_source_locations, bool print_attributes,
+                          bool print_scopes, bool print_body) const {
   auto outs = outputs();
   indent(out, level) << const_value_list_with_types(outs);
   out << " = ";
@@ -222,12 +226,13 @@ std::ostream& Node::print(
     auto* pyOp = static_cast<const ::torch::jit::PythonOp*>(this);
     out << "^" << pyOp->name();
     pyOp->writeScalars(out);
-  } else {
+  } else if (print_attributes) {
     if (hasAttribute(attr::Subgraph) && groups) {
       out << kind().toQualString() << "_" << groups->size();
       if (numAttributes() > 1 && kind() != prim::DifferentiableGraph) {
         printAttributes(out, /*ignore_subgraph=*/true);
       }
+
       groups->push_back(this);
     } else {
       out << kind().toQualString();
@@ -238,13 +243,31 @@ std::ostream& Node::print(
   }
 
   out << "(" << inputs() << ")";
-  std::string scName = scopeName();
-  if (scName.empty()) {
-    out << "\n";
-  } else {
-    out << ", ";
-    out << "scope: " << scName << "\n";
+
+  if (print_scopes) {
+    std::string scName = scopeName();
+    if (!scName.empty()) {
+      out << ", ";
+      out << "scope: " << scName;
+    }
   }
+
+  // In debug print, append file:line:col as a comment after each node
+  if (print_source_locations) {
+    if (auto file_line_col = sourceRange().file_line_col()) {
+      std::string filename;
+      size_t line, col;
+      std::tie(filename, line, col) = *file_line_col;
+      out << " # " << filename << ":" << line << ":" << col;
+    }
+  }
+
+  if (!print_body) {
+    return out;
+  }
+
+  out << "\n";
+
   for (size_t i = 0; i < blocks().size(); ++i) {
     auto b = blocks()[i];
     indent(out, level + 1) << "block" << i << "("
@@ -255,6 +278,7 @@ std::ostream& Node::print(
     }
     indent(out, level + 2) << "-> (" << b->outputs() << ")\n";
   }
+
   return out;
 }
 
@@ -262,14 +286,15 @@ std::ostream& operator<<(std::ostream& out, const Node& n) {
   return n.print(out, 0, nullptr);
 }
 
-std::ostream& operator<<(std::ostream& out, const Graph& g) {
-  out << "graph(" << const_value_list_with_types(g.inputs(), ",\n      ")
+std::ostream& Graph::print(std::ostream& out, bool print_source_locations)
+    const {
+  out << "graph(" << const_value_list_with_types(inputs(), ",\n      ")
       << "):\n";
   std::vector<const Node*> groups;
-  for (auto n : g.nodes()) {
-    n->print(out, 1, &groups);
+  for (auto n : nodes()) {
+    n->print(out, 1, &groups, print_source_locations);
   }
-  out << "  return (" << g.outputs() << ")\n";
+  out << "  return (" << outputs() << ")\n";
   size_t i = 0;
   for (auto fg : groups) {
     out << "with " << fg->kind().toQualString() << "_" << i++ << " = "
@@ -280,7 +305,7 @@ std::ostream& operator<<(std::ostream& out, const Graph& g) {
   {
     out << "\n";
     out << "all_nodes:\n";
-    for (auto& n : g.all_nodes) {
+    for (auto& n : all_nodes) {
       printNode(out, const_cast<Node*>(n), nullptr);
     }
   }
@@ -288,27 +313,18 @@ std::ostream& operator<<(std::ostream& out, const Graph& g) {
   return out;
 }
 
-std::ostream& Graph::prettyPrint(std::ostream& out) {
-  std::vector<at::Tensor> tensor_table;
-  std::vector<ClassTypePtr> class_table;
-  PythonPrint(out, *this, tensor_table, class_table);
-  return out;
-}
-
-void Graph::dumpPretty() {
-  std::vector<at::Tensor> tensor_table;
-  std::vector<ClassTypePtr> class_table;
-  PythonPrint(std::cout, *this, tensor_table, class_table);
+std::ostream& operator<<(std::ostream& out, const Graph& g) {
+  return g.print(out, true);
 }
 
 static void checkSameDevice(const Node* node) {
   bool has_device = false;
   c10::optional<at::Device> device = c10::nullopt;
   auto checkValue = [&](const Value* v) {
-    if (CompleteTensorTypePtr type = v->type()->cast<CompleteTensorType>()) {
-      if (!has_device) {
+    if (TensorTypePtr type = v->type()->cast<TensorType>()) {
+      if (type->device() && !has_device) {
         has_device = true;
-        device = type->device();
+        device = *type->device();
       } else {
         AT_ASSERT(device == type->device());
       }
@@ -553,9 +569,14 @@ void LintGraph(std::shared_ptr<Graph>& graph) {
 
 Block::Block(Graph* graph_, Node* node_)
     : graph_(graph_),
-      output_(initOutput(graph_->create(prim::Return, 0))),
+      output_(graph_->create(prim::Return, 0)),
       input_(graph_->create(prim::Param, 0)),
       owning_node_(node_) {
+  input_->next() = output_;
+  input_->prev() = output_;
+  output_->next() = input_;
+  output_->prev() = input_;
+
   graph_->all_blocks.emplace(this);
   output_->owning_block_ = this;
   output_->topo_position_ = kUpperBound;
@@ -620,10 +641,42 @@ std::shared_ptr<Graph> Graph::copy() {
   auto new_g = std::make_shared<Graph>();
   auto env = [](Value* v) -> Value* {
     AT_ERROR(
-        "Graph::copy() encountered a use of a value not in scope. Run lint!");
+        "Graph::copy() encountered a use of a value " + v->debugName() +
+        " not in scope. Run lint!");
   };
   new_g->block()->cloneFrom(this->block(), env);
   return new_g;
+}
+
+void Block::remapTypes(const std::function<TypePtr(TypePtr)>& type_map) {
+  for (Value* input : inputs()) {
+    input->setType(type_map(input->type()));
+  }
+  for (Node* node : nodes()) {
+    for (Value* output : node->outputs()) {
+      output->setType(type_map(output->type()));
+    }
+    for (Block* sub_block : node->blocks()) {
+      sub_block->remapTypes(type_map);
+    }
+    for (Symbol name : node->attributeNames()) {
+      if (node->kindOf(name) == AttributeKind::g) {
+        node->g(name)->remapTypes(type_map);
+      } else if (node->kindOf(name) == AttributeKind::gs) {
+        for (const auto& g : node->gs(name)) {
+          g->remapTypes(type_map);
+        }
+      }
+    }
+  }
+}
+
+void Graph::remapTypes(const std::function<TypePtr(TypePtr)>& type_map) {
+  block()->remapTypes(type_map);
+}
+
+void Value::inferTypeFrom(const at::Tensor& output) {
+  setType(TensorType::create(output));
 }
 
 bool Value::mustBeNone() const {
@@ -634,8 +687,8 @@ bool Value::mustNotBeNone() const {
       !type()->cast<OptionalType>();
 }
 
-std::string Value::uniqueNameBase() const {
-  std::string name = uniqueName();
+std::string Value::debugNameBase() const {
+  std::string name = debugName();
   std::string name_base = name;
   auto last_dot_pos = name.find_last_of('.');
   if (last_dot_pos != std::string::npos && last_dot_pos + 1 != name.size()) {
@@ -661,7 +714,7 @@ bool Value::isValidName(const std::string& name) {
   return true;
 }
 
-Value* Value::setUniqueName(const std::string& name) {
+Value* Value::setDebugName(const std::string& name) {
   if (!isValidName(name)) {
     throw std::runtime_error("Invalid name: '" + name + "'");
   }
@@ -669,7 +722,7 @@ Value* Value::setUniqueName(const std::string& name) {
   auto& names = node()->owningGraph()->unique_names_;
 
   // clear any old name from the map
-  if (hasUniqueName()) {
+  if (hasDebugName()) {
     names.erase(unique_name_);
     unique_name_ = "";
   }
@@ -698,7 +751,7 @@ Value* Value::setUniqueName(const std::string& name) {
       ss << name_base << "." << suffix++;
       replacement_name = ss.str();
     } while (names.count(replacement_name) > 0);
-    old_owner_of_name->second->setUniqueName(replacement_name);
+    old_owner_of_name->second->setDebugName(replacement_name);
   }
 
   names[name] = this;
@@ -708,8 +761,8 @@ Value* Value::setUniqueName(const std::string& name) {
 
 Value* Value::copyMetadata(Value* from) {
   setType(from->type());
-  if (from->hasUniqueName()) {
-    setUniqueName(from->uniqueName());
+  if (from->hasDebugName()) {
+    setDebugName(from->debugName());
   }
   return this;
 }
@@ -773,17 +826,34 @@ void Node::dump() const {
   std::cout << *this << "\n";
 }
 
-void Node::findSchema() const {
-  schema_ = &getOperatorFor(this).schema();
+const FunctionSchema& Node::schema() const {
+  if (op_) {
+    return op_->schema();
+  }
+  return getOperatorFor(this).schema();
 }
 
 const FunctionSchema* Node::maybeSchema() const {
-  if (!schema_) {
+  if (auto op = maybeOperator()) {
+    return &op->schema();
+  }
+  return nullptr;
+}
+
+const Operator& Node::getOperator() const {
+  if (!op_) {
+    op_ = &getOperatorFor(this);
+  }
+  return *op_;
+}
+
+const Operator* Node::maybeOperator() const {
+  if (!op_) {
     if (auto op = findOperatorFor(this)) {
-      schema_ = &op->schema();
+      op_ = op.get();
     }
   }
-  return schema_;
+  return op_;
 }
 
 bool Node::isNondeterministic() const {
@@ -833,18 +903,56 @@ bool Node::hasSideEffects() const {
     case prim::RaiseException:
     case prim::SetAttr:
     case aten::warn:
+    case aten::save:
+    case aten::manual_seed:
     case prim::AddStatValue:
     case prim::TimePoint:
+    case prim::CallFunction:
+    case prim::CallMethod:
+    case prim::BailoutTemplate:
       return true;
   }
-  // All other builtin ops are known to be safe.
-  // see [custom operator aliasing]
-  if (kind_.is_aten() || kind_.is_prim() || kind_.is_onnx()) {
+
+  auto op = maybeOperator();
+  if (!op) {
+    TORCH_INTERNAL_ASSERT(
+        kind_.is_prim(),
+        "Only prim ops are allowed to not have a registered operator but ",
+        kind_.toDisplayString(),
+        " doesn't have one either. We don't know if this op has side effects.");
     return false;
   }
 
-  // Custom ops may have arbitrary side effects
-  return true;
+  if (kind_.is_prim() || kind_.is_aten()) {
+    // TODO There is nothing in the system that relies on aten:: and prim::
+    // ops using AliasAnalysisKind::FROM_SCHEMA,
+    // AliasAnalysisKind::INTERNAL_SPECIAL_CASE, or
+    // AliasAnalysisKind::CONSERVATIVE but this is the intended behavior for all
+    // current ops and a good error check. We can consider lifting this
+    // constraint later if we have a use case for it.
+    TORCH_INTERNAL_ASSERT(
+        op->aliasAnalysisKind() == AliasAnalysisKind::INTERNAL_SPECIAL_CASE ||
+            op->aliasAnalysisKind() == AliasAnalysisKind::FROM_SCHEMA ||
+            op->aliasAnalysisKind() == AliasAnalysisKind::CONSERVATIVE,
+        "aten:: and prim:: ops should have AliasAnalysisKind::INTERNAL_SPECIAL_CASE"
+        ", AliasAnalysisKind::FROM_SCHEMA or AliasAnalysisKind::CONSERVATIVE but ",
+        kind_.toDisplayString(),
+        " has ",
+        toString(op->aliasAnalysisKind()));
+  }
+
+  switch (op->aliasAnalysisKind()) {
+    case AliasAnalysisKind::PURE_FUNCTION:
+      return false;
+    case AliasAnalysisKind::FROM_SCHEMA:
+      return false;
+    case AliasAnalysisKind::INTERNAL_SPECIAL_CASE:
+      return false;
+    case AliasAnalysisKind::CONSERVATIVE:
+      return true;
+  }
+  TORCH_INTERNAL_ASSERT(false, "Unhandled AliasAnalysisKind case");
+  return false; // silence compiler warning
 }
 
 // Assign this node a topological position, to facilitate fast isBefore() and
@@ -860,13 +968,15 @@ bool Node::hasSideEffects() const {
 // If we ever run out of space (by, e.g. inserting too much in place), we
 // reindex by spreading out all the nodes again.
 void Node::assignTopoPosition() {
-  auto returnNode = owningBlock()->return_node();
+  bool is_first = prev() == owningBlock()->param_node();
+  bool is_last = next() == owningBlock()->return_node();
+
   const auto prevPos = prev()->topo_position_;
   const auto nextPos = next()->topo_position_;
 
   // Append to the end of the graph
-  if (next() == returnNode) {
-    if (next() == prev()) {
+  if (is_last) {
+    if (is_first) {
       // the node list is empty, assign the first position
       topo_position_ = kMidPoint;
       return;
@@ -881,14 +991,13 @@ void Node::assignTopoPosition() {
     topo_position_ = prevPos + kAppendInterval;
 
     // Prepend to the graph
-  } else if (prev() == returnNode) {
+  } else if (is_first) {
     // next() is the first element in the block list
     if (nextPos <= (kLowerBound + kAppendInterval)) {
       // we're running off the edge
       owningBlock()->reIndexTopology();
       return;
     }
-
     topo_position_ = nextPos - kAppendInterval;
 
     // insert between two existing nodes
@@ -908,7 +1017,7 @@ Node::Node(Graph* graph_, NodeKind kind_)
       graph_(graph_),
       owning_block_(nullptr),
       scope_(graph_->current_scope_),
-      schema_(nullptr),
+      op_(nullptr),
       topo_position_(0) {
   graph_->all_nodes.emplace(this);
 }
@@ -916,7 +1025,7 @@ Node::Node(Graph* graph_, NodeKind kind_)
 void Node::eraseOutput(size_t i) {
   AT_ASSERT(i < outputs_.size());
   AT_ASSERT(outputs_[i]->uses().empty());
-  schema_ = nullptr;
+  op_ = nullptr;
   Value* n = outputs_[i];
   outputs_.erase(outputs_.begin() + i);
   owningGraph()->freeValue(n);
@@ -926,14 +1035,14 @@ void Node::eraseOutput(size_t i) {
 }
 
 Block* Node::addBlock() {
-  schema_ = nullptr;
+  op_ = nullptr;
   blocks_.push_back(new Block(owningGraph(), this));
   return blocks_.back();
 }
 
 void Node::eraseBlock(size_t i) {
   AT_ASSERT(i < blocks_.size());
-  schema_ = nullptr;
+  op_ = nullptr;
   Block* n = blocks_[i];
   blocks_.erase(blocks_.begin() + i);
   n->destroy();
@@ -954,7 +1063,7 @@ void Node::destroy() {
 }
 
 void Node::cloneFrom(Node* s) {
-  setSourceLocation(s->getSourceLocation());
+  source_range_ = s->source_range_;
   if (s->scope_ && !s->scope_->isBlank()) {
     scope_ = s->scope_;
   }
@@ -971,7 +1080,7 @@ void Node::replaceAllUsesWith(Node* n) {
 
 Value* Node::insertInput(size_t i, Value* value) {
   AT_ASSERT(graph_ == value->owningGraph());
-  schema_ = nullptr;
+  op_ = nullptr;
   // First we update the offsets for all existing inputs that will reside
   // after the one we're inserting. Concretely, these are the inputs at
   // indices [i, # input). Since we're inserting one input before all of
@@ -990,7 +1099,7 @@ Value* Node::insertInput(size_t i, Value* value) {
 
 Value* Node::addInput(Value* value) {
   AT_ASSERT(graph_ == value->owningGraph());
-  schema_ = nullptr;
+  op_ = nullptr;
   value->uses_.emplace_back(this, inputs_.size());
   inputs_.push_back(value);
   return value;
@@ -998,7 +1107,7 @@ Value* Node::addInput(Value* value) {
 
 Value* Node::replaceInput(size_t i, Value* newValue) {
   AT_ASSERT(newValue->owningGraph() == graph_);
-  schema_ = nullptr;
+  op_ = nullptr;
   Value* old = dropInput(i);
   inputs_[i] = newValue;
   newValue->uses_.emplace_back(this, i);
@@ -1008,7 +1117,7 @@ Value* Node::replaceInput(size_t i, Value* newValue) {
 void Node::replaceInputWith(Value* from, Value* to) {
   AT_ASSERT(from->owningGraph() == graph_);
   AT_ASSERT(to->owningGraph() == graph_);
-  schema_ = nullptr;
+  op_ = nullptr;
   size_t i = 0;
   for (auto input : inputs()) {
     if (input == from) {
@@ -1020,12 +1129,12 @@ void Node::replaceInputWith(Value* from, Value* to) {
 
 Value* Node::addOutput() {
   outputs_.push_back(new Value(this, outputs_.size()));
-  schema_ = nullptr;
+  op_ = nullptr;
   return outputs_.back();
 }
 
 Value* Node::insertOutput(size_t i) {
-  schema_ = nullptr;
+  op_ = nullptr;
   outputs_.insert(outputs_.begin() + i, new Value(this, i));
   for (size_t itr = i + 1; itr < outputs_.size(); ++itr) {
     outputs_[itr]->setOffset(outputs_[itr]->offset() + 1);
@@ -1088,6 +1197,9 @@ Node* Node::insertBefore(Node* n) {
 Node* Node::insertAfter(Node* n) {
   AT_ASSERT(!inBlockList() && n->inBlockList());
   AT_ASSERT(n->owningBlock());
+  AT_ASSERTM(
+      n->kind() != prim::Return,
+      "Attempting to insert a Node after the Return node or before the Param node");
   this->owning_block_ = n->owningBlock();
   Node* next = n->next();
   n->next() = this;
@@ -1109,7 +1221,7 @@ void Node::moveBefore(Node* n) {
 }
 
 void Node::removeInput(size_t i) {
-  schema_ = nullptr;
+  op_ = nullptr;
   dropInput(i);
   // everything after this input shifts left,
   // so we need to update their use offsets to match
@@ -1121,11 +1233,40 @@ void Node::removeInput(size_t i) {
 }
 
 void Node::removeAllInputs() {
-  schema_ = nullptr;
+  op_ = nullptr;
   for (size_t i = 0; i < inputs().size(); ++i) {
     dropInput(i);
   }
   inputs_.clear();
+}
+
+void Node::permuteInputs(const std::vector<size_t>& new_order) {
+  op_ = nullptr;
+  AT_ASSERT(new_order.size() == inputs_.size());
+  std::vector<Value*> new_inputs;
+  new_inputs.reserve(new_order.size());
+  for (size_t i = 0; i < new_order.size(); ++i) {
+    AT_ASSERTM(inputs_.at(new_order[i]) != nullptr, "Repeated index");
+    new_inputs.push_back(inputs_.at(new_order[i]));
+    auto it = findUseForInput(new_order[i]);
+    it->offset = i;
+    inputs_.at(new_order[i]) = nullptr;
+  }
+  inputs_ = std::move(new_inputs);
+}
+
+void Node::permuteOutputs(const std::vector<size_t>& new_order) {
+  op_ = nullptr;
+  AT_ASSERT(new_order.size() == outputs_.size());
+  std::vector<Value*> new_outputs;
+  new_outputs.reserve(new_order.size());
+  for (size_t i = 0; i < new_order.size(); ++i) {
+    AT_ASSERTM(outputs_.at(new_order[i]) != nullptr, "Repeated index");
+    new_outputs.push_back(outputs_.at(new_order[i]));
+    outputs_.at(new_order[i])->setOffset(i);
+    outputs_.at(new_order[i]) = nullptr;
+  }
+  outputs_ = std::move(new_outputs);
 }
 
 use_list::iterator Node::findUseForInput(size_t i) {
@@ -1158,8 +1299,7 @@ void Node::removeFromList() {
 }
 
 inline const SourceRange& fakeRange() {
-  static SourceRange range(
-      std::make_shared<std::string>("<internally-created-node>"), 0, 1);
+  static SourceRange range(std::make_shared<Source>(""), 0, 1);
   return range;
 }
 
@@ -1202,23 +1342,31 @@ Node* Graph::createAutogradZero() {
   return create(prim::AutogradZero);
 }
 
-Node* Graph::createNone(TypePtr typ) {
+Node* Graph::createNone() {
   Node* n = create(prim::Constant);
-  n->output()->setType(OptionalType::create(std::move(typ)));
+  n->output()->setType(NoneType::get());
   return n;
 }
 
-Node* Graph::createFusionGroup() {
-  auto n = create(prim::FusionGroup, 0);
+Node* Graph::createUninitialized(TypePtr typ) {
+  Node* n = create(prim::Uninitialized);
+  n->output()->setType(std::move(typ));
+  return n;
+}
+
+Node* Graph::createWithSubgraph(Symbol kind) {
+  auto n = create(kind, 0);
   n->g_(attr::Subgraph, std::make_shared<Graph>(current_scope()));
   return n;
 }
 
 Node* Graph::createTuple(
     at::ArrayRef<Value*> values,
-    c10::OptNameList field_names) {
+    c10::optional<c10::QualifiedName> qualname,
+    std::shared_ptr<FunctionSchema> schema) {
   auto types = fmap(values, [](Value* v) { return v->type(); });
-  auto tt = TupleType::create(std::move(types), std::move(field_names));
+  auto tt = TupleType::create(
+      std::move(types), std::move(qualname), std::move(schema));
   auto n = create(prim::TupleConstruct, values);
   n->output()->setType(tt);
   return n;
@@ -1233,11 +1381,12 @@ Node* Graph::createTupleUnpack(Value* v) {
   return n;
 }
 
-Node* Graph::createTupleIndex(Value* tup, int64_t index) {
-  auto n = create(prim::TupleIndex, {tup});
-  n->i_(attr::index, index);
-  auto tuple_type = tup->type()->expect<TupleType>();
-  n->output()->setType(tuple_type->elements().at(index));
+Node* Graph::createTupleIndex(
+    Value* tup,
+    Value* idx,
+    const TypePtr& output_type) {
+  auto n = create(prim::TupleIndex, {tup, idx});
+  n->output()->setType(output_type);
   return n;
 }
 
@@ -1258,7 +1407,13 @@ Node* Graph::createTupleSlice(Value* tup, int64_t beg, int64_t end) {
 Node* Graph::createList(const TypePtr& elem_type, at::ArrayRef<Value*> values) {
   auto n = create(prim::ListConstruct, values);
   for (const auto& v : values) {
-    AT_ASSERT(v->type()->isSubtypeOf(elem_type));
+    TORCH_CHECK(
+        v->type()->isSubtypeOf(elem_type),
+        "Expected a list element that subtypes '",
+        elem_type->python_str(),
+        "' but got an element of type '",
+        v->type()->python_str(),
+        "'");
   }
   n->output()->setType(ListType::create(elem_type));
   return n;
@@ -1291,19 +1446,10 @@ Node* Graph::createDict(
   return n;
 }
 
-Node* Graph::createDictIndex(Value* dict, Value* index) {
-  auto dict_type = dict->type()->expect<DictType>();
-  AT_ASSERT(index->type()->isSubtypeOf(dict_type->getKeyType()));
-
-  auto n = create(prim::DictIndex, {dict, index});
-  n->output()->setType(dict_type->getValueType());
-  return n;
-}
-
 Node* Graph::createNumToTensor(Value* value) {
   auto typ = value->type();
   Node* result = create(prim::NumToTensor, {value});
-  result->output()->setType(CompleteTensorType::fromNumberType(std::move(typ)));
+  result->output()->setType(TensorType::fromNumberType(std::move(typ)));
   return result;
 }
 
@@ -1339,6 +1485,45 @@ Node* Graph::createGetAttr(Value* obj, const std::string& field) {
   return n;
 }
 
+Node* Graph::createStore(const std::string& name, Value* v) {
+  auto n = create(prim::Store, {v}, /*num_outputs*/ 0);
+  n->s_(attr::name, name);
+  return n;
+}
+
+Node* Graph::createLoad(const std::string& name, const TypePtr& type) {
+  auto n = create(prim::Load, {}, /*num_outputs*/ 1);
+  n->s_(attr::name, name);
+  n->output()->setType(type);
+  return n;
+}
+
+Value* Graph::insertFunctionCall(
+    Function* callee,
+    const script::MatchedSchema& matched) {
+  std::string func_name = callee->name();
+  Value* fn_constant = insertNode(create(prim::Constant))
+                           ->s_(attr::name, func_name)
+                           ->output()
+                           ->setType(FunctionType::create(std::move(callee)));
+  std::vector<Value*> inputs = {fn_constant};
+  inputs.insert(inputs.end(), matched.inputs.begin(), matched.inputs.end());
+  Value* result = insertNode(create(prim::CallFunction, inputs))
+                      ->output()
+                      ->setType(matched.return_types.at(0));
+  return result;
+}
+
+Value* Graph::insertMethodCall(
+    std::string method_name,
+    const script::MatchedSchema& matched) {
+  Value* result = insertNode(create(prim::CallMethod, matched.inputs))
+                      ->s_(attr::name, std::move(method_name))
+                      ->output()
+                      ->setType(matched.return_types.at(0));
+  return result;
+}
+
 Node* Graph::createClone(
     Node* n,
     const std::function<Value*(Value*)>& value_map,
@@ -1362,16 +1547,15 @@ Node* Graph::createClone(
 
 Value* Graph::insertConstant(
     IValue val,
-    const TypePtr& result_type,
     c10::optional<SourceRange> loc,
     c10::optional<ScopePtr> scope) {
   return jit::insertConstant(
-      *this, std::move(val), result_type, std::move(loc), std::move(scope));
+      *this, std::move(val), std::move(loc), std::move(scope));
 }
 
-std::string Graph::toString() const {
+std::string Graph::toString(bool print_source_locations) const {
   std::ostringstream oss;
-  oss << *this;
+  print(oss, print_source_locations);
   return oss.str();
 }
 
@@ -1394,7 +1578,7 @@ void Graph::freeNode(Node* n) {
   all_nodes.erase(it);
 }
 void Graph::freeValue(Value* v) {
-  v->setUniqueName("");
+  v->setDebugName("");
   auto it = all_values.find(v);
   AT_ASSERT(it != all_values.end());
   delete *it;
@@ -1418,10 +1602,47 @@ at::ArrayRef<Value*> createTupleUnpack(Value* v) {
 }
 
 std::vector<Value*> inlineCallTo(
+    Node* to_replace,
+    Graph& callee) {
+  WithInsertPoint guard(to_replace);
+  auto new_outputs =
+      insertGraph(*to_replace->owningGraph(), callee, to_replace->inputs());
+  const auto& old_outputs = to_replace->outputs();
+
+  AT_ASSERT(new_outputs.size() == old_outputs.size());
+  for (size_t i = 0; i < old_outputs.size(); ++i) {
+    if (old_outputs[i]->hasDebugName()) {
+      new_outputs[i]->setDebugName(old_outputs[i]->debugName());
+    }
+    old_outputs[i]->replaceAllUsesWith(new_outputs[i]);
+  }
+  to_replace->destroy();
+
+  return new_outputs;
+}
+
+std::vector<Value*> unpackOutputs(const std::vector<Value*>& outputs) {
+  std::vector<Value*> new_outputs;
+  if (outputs.size() != 1 || outputs.at(0)->type()->kind() != TupleType::Kind) {
+    return outputs;
+  }
+
+  auto tup = outputs[0];
+  for (Value* v : createTupleUnpack(tup)) {
+    new_outputs.emplace_back(v);
+  }
+  // if this was a peephole tuple unpack we can just get rid of
+  // the tuple construct here and prevent needing DCE
+  if (tup->node()->kind() == prim::TupleConstruct && !tup->node()->hasUses()) {
+    tup->node()->destroy();
+  }
+  return new_outputs;
+}
+
+std::vector<Value*> insertGraph(
     Graph& g,
     Graph& callee,
-    ArrayRef<Value*> inputs,
-    bool unpack_outputs) {
+    ArrayRef<Value*> inputs) {
   std::unordered_map<Value*, Value*> value_map;
   auto value_map_func = [&](Value* v) { return value_map.at(v); };
   AT_ASSERT(callee.inputs().size() == inputs.size());
@@ -1440,23 +1661,18 @@ std::vector<Value*> inlineCallTo(
     outputs.push_back(value_map_func(output));
   }
 
-  if (unpack_outputs && outputs.size() == 1 &&
-      callee.outputs().at(0)->type()->kind() == TupleType::Kind) {
-    auto tup = outputs[0];
-    outputs.clear();
-    for (Value* v : createTupleUnpack(tup)) {
-      outputs.emplace_back(v);
-    }
-    // if this was a peephole tuple unpack we can just get rid of
-    // the tuple construct here and prevent needing DCE
-    if (tup->node()->kind() == prim::TupleConstruct &&
-        !tup->node()->hasUses()) {
-      tup->node()->destroy();
-    }
-  }
-
   return outputs;
 }
 
+void ProfileOp::cloneFrom(Node* other_) {
+  Node::cloneFrom(other_);
+  auto other = other_->cast<ProfileOp>();
+  this->callback_ = other->getCallback();
+}
+Node* ProfileOp::allocNewInstance(Graph* g) {
+  return new ProfileOp(g, {nullptr});
+}
+
+constexpr Symbol ProfileOp::Kind;
 } // namespace jit
 } // namespace torch

@@ -217,10 +217,10 @@ Tensor narrowGroup(const Tensor& t, int dim, int group_idx, int64_t groups) {
 // Used on pad, stride and dilation
 static void check_args(CheckedFrom c, IntArrayRef args, size_t expected_size, const char* arg_name)
 {
-  AT_CHECK(args.size() <= expected_size,
+  TORCH_CHECK(args.size() <= expected_size,
            "Too many ", arg_name, " values (", args.size(), ") supplied, expecting ",
            expected_size, " (while checking arguments for ", c, ")");
-  AT_CHECK(args.size() >= expected_size,
+  TORCH_CHECK(args.size() >= expected_size,
            "Not enough ", arg_name, " values (", args.size(), ") supplied, expecting ",
            expected_size, " (while checking arguments for ", c, ")");
 
@@ -794,6 +794,10 @@ void cudnn_convolution_add_bias_(CheckedFrom c, const TensorArg& output, const T
   checkAllSameGPU(c, {output, bias});
   checkSize(c, bias, { output->size(output_channels_dim) });
 
+  if (output.tensor.numel() == 0) {
+    return;
+  }
+
   // See Note [CuDNN broadcast padding].  Handle the left padding
   // ourselves, but use TensorDescriptor's padding argument to do the rest.
   TensorDescriptor bdesc, odesc;
@@ -903,6 +907,10 @@ Tensor cudnn_convolution_forward(
                     conv_output_size(input->sizes(), weight->sizes(),
                                      padding, stride, dilation, groups),
                     input->options());
+
+  if (output_t.numel() == 0) {
+    return output_t;
+  }
 
   // Avoid ambiguity of "output" when this is being used as backwards
   TensorArg output{ output_t, "result", 0 };
@@ -1085,14 +1093,26 @@ std::tuple<at::Tensor,at::Tensor,at::Tensor> cudnn_convolution_backward(
   Tensor grad_output = grad_output_t.contiguous();
 
   Tensor grad_input, grad_weight, grad_bias;
-  if (output_mask[0]) {
-    grad_input = at::cudnn_convolution_backward_input(input.sizes(), grad_output, weight, padding, stride, dilation, groups, benchmark, deterministic);
-  }
-  if (output_mask[1]) {
-    grad_weight = at::cudnn_convolution_backward_weight(weight.sizes(), grad_output, input, padding, stride, dilation, groups, benchmark, deterministic);
-  }
-  if (output_mask[2]) {
-    grad_bias = at::cudnn_convolution_backward_bias(grad_output);
+  if (input.numel() == 0) {
+    if (output_mask[0]) {
+      grad_input = at::empty_like(input);
+    }
+    if (output_mask[1]) {
+      grad_weight = at::zeros_like(weight);
+    }
+    if (output_mask[2]) {
+      grad_bias = at::zeros({grad_output.size(1)}, grad_output.options());
+    }
+  } else {
+    if (output_mask[0]) {
+      grad_input = at::cudnn_convolution_backward_input(input.sizes(), grad_output, weight, padding, stride, dilation, groups, benchmark, deterministic);
+    }
+    if (output_mask[1]) {
+      grad_weight = at::cudnn_convolution_backward_weight(weight.sizes(), grad_output, input, padding, stride, dilation, groups, benchmark, deterministic);
+    }
+    if (output_mask[2]) {
+      grad_bias = at::cudnn_convolution_backward_bias(grad_output);
+    }
   }
 
   return std::tuple<Tensor,Tensor,Tensor>{grad_input, grad_weight, grad_bias};

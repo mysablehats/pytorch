@@ -1,8 +1,11 @@
 #pragma once
 
 #include <torch/nn/cloneable.h>
+#include <torch/nn/options/dropout.h>
 #include <torch/nn/pimpl.h>
 #include <torch/types.h>
+
+#include <torch/csrc/WindowsTorchApiMacro.h>
 
 #include <cstddef>
 #include <vector>
@@ -10,20 +13,11 @@
 namespace torch {
 namespace nn {
 
-/// Options for `Dropout` and `FeatureDropout`.
-struct TORCH_API DropoutOptions {
-  /* implicit */ DropoutOptions(double rate = 0.5);
-  /// The probability with which a particular component of the input is set to
-  /// zero.
-  /// Changes to this parameter at runtime are effective.
-  TORCH_ARG(double, rate);
-};
-
 namespace detail {
 template <typename Derived>
 class DropoutImplBase : public torch::nn::Cloneable<Derived> {
  public:
-  explicit DropoutImplBase(DropoutOptions options_ = DropoutOptions());
+  explicit DropoutImplBase(const DropoutOptions& options_ = DropoutOptions());
 
   void reset() override;
 
@@ -38,7 +32,7 @@ class DropoutImplBase : public torch::nn::Cloneable<Derived> {
 /// about the exact semantics of this module.
 class TORCH_API DropoutImpl : public detail::DropoutImplBase<DropoutImpl> {
  public:
-  using detail::DropoutImplBase<DropoutImpl>::DropoutImplBase;
+  explicit DropoutImpl(const DropoutOptions& options_ = DropoutOptions());
 
   /// During training, applies a noise mask to the input tensor.
   /// During evaluation, applies an identity function.
@@ -60,7 +54,7 @@ class TORCH_API DropoutImpl : public detail::DropoutImplBase<DropoutImpl> {
 class TORCH_API FeatureDropoutImpl
     : public detail::DropoutImplBase<FeatureDropoutImpl> {
  public:
-  using detail::DropoutImplBase<FeatureDropoutImpl>::DropoutImplBase;
+  explicit FeatureDropoutImpl(const DropoutOptions& options_ = DropoutOptions());
 
   /// During training, applies a noise mask to the input tensor.
   /// During evaluation, applies an identity function.

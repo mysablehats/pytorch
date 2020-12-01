@@ -622,10 +622,8 @@ CAFFE2_CUDA_EXPORT void Gemm<at::Half, CUDAContext>(
         N, // ldd
         rocblas_datatype_f32_r, // compute type
         rocblas_gemm_algo_standard, // rocblas_gemm_algo
-        0, // solution index, reserved for future use
-        0, // flags, reserved for future use
-        NULL, // size of workspace
-        NULL)); // workspace
+        0,   // solution index, reserved for future use
+        0)); // flags, reserved for future use
 #else
     CUBLAS_ENFORCE(cublasSgemmEx(
         context->cublas_handle(),
@@ -1033,10 +1031,8 @@ CAFFE2_CUDA_EXPORT void GemmStridedBatched<at::Half, CUDAContext>(
         batch_size,
         rocblas_datatype_f32_r, // compute type
         rocblas_gemm_algo_standard, // rocblas_gemm_algo
-        0, // solution index, reserved for future use
-        0, // flags, reserved for future use
-        NULL, // size of workspace
-        NULL)); // workspace
+        0,   // solution index, reserved for future use
+        0)); // flags, reserved for future use
 #else
     CUBLAS_ENFORCE(cublasGemmStridedBatchedEx(
         context->cublas_handle(),
@@ -1093,6 +1089,137 @@ CAFFE2_CUDA_EXPORT void GemmStridedBatched<at::Half, CUDAContext>(
     CAFFE_THROW("Unsupported math type");
   }
 #endif
+}
+
+template <>
+CAFFE2_CUDA_EXPORT void Gemv<float, CUDAContext>(
+    const CBLAS_TRANSPOSE trans_A,
+    const int M,
+    const int N,
+    const float alpha,
+    const float* A,
+    const float* x,
+    const float beta,
+    float* y,
+    CUDAContext* context,
+    TensorProto::DataType math_type) {
+  const cublasOperation_t cu_trans_A =
+      (trans_A == CblasNoTrans) ? CUBLAS_OP_T : CUBLAS_OP_N;
+  CUBLAS_ENFORCE(
+      cublasSetPointerMode(context->cublas_handle(), CUBLAS_POINTER_MODE_HOST));
+  CUBLAS_ENFORCE(cublasSgemv(
+      context->cublas_handle(),
+      cu_trans_A,
+      N,
+      M,
+      &alpha,
+      A,
+      N,
+      x,
+      1,
+      &beta,
+      y,
+      1));
+}
+
+template <>
+CAFFE2_CUDA_EXPORT void Gemv<at::Half, CUDAContext>(
+    const CBLAS_TRANSPOSE trans_A,
+    const int M,
+    const int N,
+    const float alpha,
+    const at::Half* A,
+    const at::Half* x,
+    const float beta,
+    at::Half* y,
+    CUDAContext* context,
+    TensorProto::DataType math_type) {
+  const cublasOperation_t cu_trans_A =
+      (trans_A == CblasNoTrans) ? CUBLAS_OP_T : CUBLAS_OP_N;
+
+  // sort out what we need to call cublasSgemmEx / cublasHgemm
+  const int m = (cu_trans_A == CUBLAS_OP_N) ? N : M;
+  const int k = (cu_trans_A == CUBLAS_OP_N) ? M : N;
+  const int lda = (cu_trans_A == CUBLAS_OP_N) ? m : k;
+  const int ldc = m;
+
+  if (math_type == TensorProto_DataType_FLOAT) {
+    CUBLAS_ENFORCE(cublasSetPointerMode(
+        context->cublas_handle(), CUBLAS_POINTER_MODE_HOST));
+#ifdef __HIP_PLATFORM_HCC__
+    // rocblas doesn't support cublasSgemmEx type API yet.
+    // It has more general rocblas_gemm_ex API which is more close to
+    // cublasGemmEx rocblas_gemm_ex does D = alpha*op( A )*op( B ) + beta*C,
+    // whereas cublasgemmEx does C = alpha*op( A )*op( B ) + beta*C
+    ROCBLAS_ENFORCE(rocblas_gemm_ex(
+        context->rocblashandle(),
+        cu_trans_A,
+        rocblas_operation_none,
+        m,
+        1,
+        k,
+        &alpha,
+        A,
+        rocblas_datatype_f16_r,
+        lda,
+        x,
+        rocblas_datatype_f16_r,
+        k,
+        &beta,
+        y,
+        rocblas_datatype_f16_r,
+        ldc,
+        y, // D
+        rocblas_datatype_f16_r, // D type
+        ldc, // ldd
+        rocblas_datatype_f32_r, // compute type
+        rocblas_gemm_algo_standard, // rocblas_gemm_algo
+        0,   // solution index, reserved for future use
+        0)); // flags, reserved for future use
+#else
+    CUBLAS_ENFORCE(cublasSgemmEx(
+        context->cublas_handle(),
+        cu_trans_A,
+        CUBLAS_OP_N,
+        m,
+        1,
+        k,
+        &alpha,
+        A,
+        CUDA_R_16F,
+        lda,
+        x,
+        CUDA_R_16F,
+        k,
+        &beta,
+        y,
+        CUDA_R_16F,
+        ldc));
+#endif // __HIP_PLATFORM_HCC__
+  } else if (math_type == TensorProto_DataType_FLOAT16) {
+    const __half alpha_fp16 = at::Half(alpha);
+    const __half beta_fp16 = at::Half(beta);
+    CUBLAS_ENFORCE(cublasSetPointerMode(
+        context->cublas_handle(), CUBLAS_POINTER_MODE_HOST));
+    CUBLAS_ENFORCE(cublasHgemm(
+        context->cublas_handle(),
+        cu_trans_A,
+        CUBLAS_OP_N,
+        m,
+        1,
+        k,
+        reinterpret_cast<const CUBLAS_HALF_TYPE*>(&alpha_fp16),
+        reinterpret_cast<const CUBLAS_HALF_TYPE*>(A),
+        lda,
+        reinterpret_cast<const CUBLAS_HALF_TYPE*>(x),
+        k,
+        reinterpret_cast<const CUBLAS_HALF_TYPE*>(&beta_fp16),
+        reinterpret_cast<CUBLAS_HALF_TYPE*>(y),
+        ldc));
+  } else {
+    // fail
+    CAFFE_THROW("Unsupported math type");
+  }
 }
 
 #if CUDA_VERSION >= 9000
@@ -1176,6 +1303,68 @@ CAFFE2_CUDA_EXPORT void Gemm<at::Half, CUDAContext, TensorCoreEngine>(
 }
 
 template <>
+CAFFE2_CUDA_EXPORT void GemmBatched<float, CUDAContext, TensorCoreEngine>(
+    const CBLAS_TRANSPOSE trans_A,
+    const CBLAS_TRANSPOSE trans_B,
+    const int batch_size,
+    const int M,
+    const int N,
+    const int K,
+    const float alpha,
+    const float** A,
+    const float** B,
+    const float beta,
+    float** C,
+    CUDAContext* context,
+    TensorProto::DataType math_type) {
+  GemmBatched<float, CUDAContext, DefaultEngine>(
+      trans_A,
+      trans_B,
+      batch_size,
+      M,
+      N,
+      K,
+      alpha,
+      A,
+      B,
+      beta,
+      C,
+      context,
+      math_type);
+}
+
+template <>
+CAFFE2_CUDA_EXPORT void GemmBatched<at::Half, CUDAContext, TensorCoreEngine>(
+    const CBLAS_TRANSPOSE trans_A,
+    const CBLAS_TRANSPOSE trans_B,
+    const int batch_size,
+    const int M,
+    const int N,
+    const int K,
+    const float alpha,
+    const at::Half** A,
+    const at::Half** B,
+    const float beta,
+    at::Half** C,
+    CUDAContext* context,
+    TensorProto::DataType math_type) {
+  GemmBatched<at::Half, CUDAContext, DefaultEngine>(
+      trans_A,
+      trans_B,
+      batch_size,
+      M,
+      N,
+      K,
+      alpha,
+      A,
+      B,
+      beta,
+      C,
+      context,
+      math_type);
+}
+
+template <>
 CAFFE2_CUDA_EXPORT void
 GemmStridedBatched<float, CUDAContext, TensorCoreEngine>(
     const CBLAS_TRANSPOSE trans_A,
@@ -1194,7 +1383,7 @@ GemmStridedBatched<float, CUDAContext, TensorCoreEngine>(
     const int C_stride,
     CUDAContext* context,
     TensorProto::DataType math_type) {
-  return GemmStridedBatched<float, CUDAContext, DefaultEngine>(
+  GemmStridedBatched<float, CUDAContext, DefaultEngine>(
       trans_A,
       trans_B,
       batch_size,
@@ -1232,7 +1421,7 @@ GemmStridedBatched<at::Half, CUDAContext, TensorCoreEngine>(
     const int C_stride,
     CUDAContext* context,
     TensorProto::DataType math_type) {
-  return GemmStridedBatched<at::Half, CUDAContext, DefaultEngine>(
+  GemmStridedBatched<at::Half, CUDAContext, DefaultEngine>(
       trans_A,
       trans_B,
       batch_size,
@@ -1249,6 +1438,38 @@ GemmStridedBatched<at::Half, CUDAContext, TensorCoreEngine>(
       C_stride,
       context,
       math_type);
+}
+
+template <>
+CAFFE2_CUDA_EXPORT void Gemv<float, CUDAContext, TensorCoreEngine>(
+    const CBLAS_TRANSPOSE trans_A,
+    const int M,
+    const int N,
+    const float alpha,
+    const float* A,
+    const float* x,
+    const float beta,
+    float* y,
+    CUDAContext* context,
+    TensorProto::DataType math_type) {
+  Gemv<float, CUDAContext, DefaultEngine>(
+      trans_A, M, N, alpha, A, x, beta, y, context, math_type);
+}
+
+template <>
+CAFFE2_CUDA_EXPORT void Gemv<at::Half, CUDAContext, TensorCoreEngine>(
+    const CBLAS_TRANSPOSE trans_A,
+    const int M,
+    const int N,
+    const float alpha,
+    const at::Half* A,
+    const at::Half* x,
+    const float beta,
+    at::Half* y,
+    CUDAContext* context,
+    TensorProto::DataType math_type) {
+  Gemv<at::Half, CUDAContext, DefaultEngine>(
+      trans_A, M, N, alpha, A, x, beta, y, context, math_type);
 }
 
 #endif // CUDA_VERSION >= 9000
@@ -1294,37 +1515,6 @@ CAFFE2_CUDA_EXPORT void GemmEx<float, CUDAContext>(
       ldc));
 }
 
-template <>
-CAFFE2_CUDA_EXPORT void Gemv<float, CUDAContext>(
-    const CBLAS_TRANSPOSE trans_A,
-    const int M,
-    const int N,
-    const float alpha,
-    const float* A,
-    const float* x,
-    const float beta,
-    float* y,
-    CUDAContext* context,
-    TensorProto::DataType math_type) {
-  const cublasOperation_t cu_trans_A =
-      (trans_A == CblasNoTrans) ? CUBLAS_OP_T : CUBLAS_OP_N;
-  CUBLAS_ENFORCE(
-      cublasSetPointerMode(context->cublas_handle(), CUBLAS_POINTER_MODE_HOST));
-  CUBLAS_ENFORCE(cublasSgemv(
-      context->cublas_handle(),
-      cu_trans_A,
-      N,
-      M,
-      &alpha,
-      A,
-      N,
-      x,
-      1,
-      &beta,
-      y,
-      1));
-}
-
 // Batched Add variants
 namespace {
 
@@ -1365,108 +1555,6 @@ __global__ void AddStripedBatchKernel(
 CAFFE2_SPECIALIZED_CUDA_ADD_STRIPED_BATCH(float);
 CAFFE2_SPECIALIZED_CUDA_ADD_STRIPED_BATCH(at::Half);
 #undef CAFFE2_SPECIALIZED_CUDA_ADD_STRIPED_BATCH
-
-template <>
-CAFFE2_CUDA_EXPORT void Gemv<at::Half, CUDAContext>(
-    const CBLAS_TRANSPOSE trans_A,
-    const int M,
-    const int N,
-    const float alpha,
-    const at::Half* A,
-    const at::Half* x,
-    const float beta,
-    at::Half* y,
-    CUDAContext* context,
-    TensorProto::DataType math_type) {
-  const cublasOperation_t cu_trans_A =
-      (trans_A == CblasNoTrans) ? CUBLAS_OP_T : CUBLAS_OP_N;
-
-  // sort out what we need to call cublasSgemmEx / cublasHgemm
-  const int m = (cu_trans_A == CUBLAS_OP_N) ? N : M;
-  const int k = (cu_trans_A == CUBLAS_OP_N) ? M : N;
-  const int lda = (cu_trans_A == CUBLAS_OP_N) ? m : k;
-  const int ldc = m;
-
-  if (math_type == TensorProto_DataType_FLOAT) {
-    CUBLAS_ENFORCE(cublasSetPointerMode(
-        context->cublas_handle(), CUBLAS_POINTER_MODE_HOST));
-#ifdef __HIP_PLATFORM_HCC__
-    // rocblas doesn't support cublasSgemmEx type API yet.
-    // It has more general rocblas_gemm_ex API which is more close to
-    // cublasGemmEx rocblas_gemm_ex does D = alpha*op( A )*op( B ) + beta*C,
-    // whereas cublasgemmEx does C = alpha*op( A )*op( B ) + beta*C
-    ROCBLAS_ENFORCE(rocblas_gemm_ex(
-        context->rocblashandle(),
-        cu_trans_A,
-        rocblas_operation_none,
-        m,
-        1,
-        k,
-        &alpha,
-        A,
-        rocblas_datatype_f16_r,
-        lda,
-        x,
-        rocblas_datatype_f16_r,
-        k,
-        &beta,
-        y,
-        rocblas_datatype_f16_r,
-        ldc,
-        y, // D
-        rocblas_datatype_f16_r, // D type
-        ldc, // ldd
-        rocblas_datatype_f32_r, // compute type
-        rocblas_gemm_algo_standard, // rocblas_gemm_algo
-        0, // solution index, reserved for future use
-        0, // flags, reserved for future use
-        NULL, // size of workspace
-        NULL)); // workspace
-#else
-    CUBLAS_ENFORCE(cublasSgemmEx(
-        context->cublas_handle(),
-        cu_trans_A,
-        CUBLAS_OP_N,
-        m,
-        1,
-        k,
-        &alpha,
-        A,
-        CUDA_R_16F,
-        lda,
-        x,
-        CUDA_R_16F,
-        k,
-        &beta,
-        y,
-        CUDA_R_16F,
-        ldc));
-#endif // __HIP_PLATFORM_HCC__
-  } else if (math_type == TensorProto_DataType_FLOAT16) {
-    const __half alpha_fp16 = at::Half(alpha);
-    const __half beta_fp16 = at::Half(beta);
-    CUBLAS_ENFORCE(cublasSetPointerMode(
-        context->cublas_handle(), CUBLAS_POINTER_MODE_HOST));
-    CUBLAS_ENFORCE(cublasHgemm(
-        context->cublas_handle(),
-        cu_trans_A,
-        CUBLAS_OP_N,
-        m,
-        1,
-        k,
-        reinterpret_cast<const CUBLAS_HALF_TYPE*>(&alpha_fp16),
-        reinterpret_cast<const CUBLAS_HALF_TYPE*>(A),
-        lda,
-        reinterpret_cast<const CUBLAS_HALF_TYPE*>(x),
-        k,
-        reinterpret_cast<const CUBLAS_HALF_TYPE*>(&beta_fp16),
-        reinterpret_cast<CUBLAS_HALF_TYPE*>(y),
-        ldc));
-  } else {
-    // fail
-    CAFFE_THROW("Unsupported math type");
-  }
-}
 
 namespace {
 template <typename T>
@@ -2588,6 +2676,22 @@ CAFFE2_CUDA_EXPORT void CopyVector<float, CUDAContext>(
         dst,
         src,
         sizeof(float) * N,
+        cudaMemcpyDeviceToDevice,
+        context->cuda_stream());
+  }
+}
+
+template <>
+CAFFE2_CUDA_EXPORT void CopyVector<int, CUDAContext>(
+    const int N,
+    const int* src,
+    int* dst,
+    CUDAContext* context) {
+  if (src != dst && N > 0) {
+    cudaMemcpyAsync(
+        dst,
+        src,
+        sizeof(int) * N,
         cudaMemcpyDeviceToDevice,
         context->cuda_stream());
   }

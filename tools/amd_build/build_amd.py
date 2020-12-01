@@ -26,14 +26,16 @@ parser.add_argument(
     '--output-directory',
     type=str,
     default='',
-    help="The Directory to Store the Hipified Project",
+    help="The directory to store the hipified project",
     required=False)
 
-# Hipify using HIP-Clang launch.
 parser.add_argument(
-    '--hip-clang-launch',
-    action='store_true',
-    help=argparse.SUPPRESS)
+    '--extra-include-dir',
+    type=str,
+    default=[],
+    nargs='+',
+    help="The list of extra directories in caffe2 to hipify",
+    required=False)
 
 args = parser.parse_args()
 
@@ -61,6 +63,7 @@ includes = [
     "caffe2/core/*",
     "caffe2/db/*",
     "caffe2/utils/*",
+    "caffe2/contrib/gloo/*",
     "c10/cuda/*",
     "c10/cuda/test/CMakeLists.txt",
     "modules/*",
@@ -70,6 +73,7 @@ includes = [
     "aten/src/ATen/native/cuda/*",
     "aten/src/ATen/native/cudnn/*",
     "aten/src/ATen/native/sparse/cuda/*",
+    "aten/src/ATen/native/quantized/cuda/*",
     "aten/src/THC/*",
     "aten/src/THCUNN/*",
     "aten/src/ATen/test/*",
@@ -80,6 +84,12 @@ includes = [
     "torch/*",
     "tools/autograd/templates/python_variable_methods.cpp",
 ]
+
+for new_dir in args.extra_include_dir:
+    abs_new_dir = os.path.join(proj_dir, new_dir)
+    if os.path.exists(abs_new_dir):
+        new_dir = os.path.join(new_dir, '**/*')
+        includes.append(new_dir)
 
 ignores = [
     "caffe2/operators/depthwise_3x3_conv_op_cudnn.cu",
@@ -92,8 +102,6 @@ ignores = [
     "torch/lib/tmp_install/*",
     "torch/include/*",
 ]
-
-json_settings = os.path.join(amd_build_dir, "disabled_features.json")
 
 if not args.out_of_place_only:
     # Apply patch files in place (PyTorch only)
@@ -112,7 +120,7 @@ if not args.out_of_place_only:
     paths = ("torch", "tools")
     for root, _directories, files in chain.from_iterable(os.walk(path) for path in paths):
         for filename in files:
-            if filename.endswith(".cpp") or filename.endswith(".h"):
+            if filename.endswith(".cpp") or filename.endswith(".h") or filename.endswith(".hpp"):
                 source = os.path.join(root, filename)
                 # Disabled files
                 if reduce(lambda result, exclude: source.endswith(exclude) or result, ignore_files, False):
@@ -128,11 +136,18 @@ if not args.out_of_place_only:
                     f.flush()
                     os.fsync(f)
 
+# Check if the compiler is hip-clang.
+def is_hip_clang():
+    try:
+        hip_path = os.getenv('HIP_PATH', '/opt/rocm/hip')
+        return 'HIP_COMPILER=clang' in open(hip_path + '/lib/.hipInfo').read()
+    except IOError:
+        return False
+
 hipify_python.hipify(
     project_directory=proj_dir,
     output_directory=out_dir,
     includes=includes,
     ignores=ignores,
     out_of_place_only=args.out_of_place_only,
-    json_settings=json_settings,
-    hip_clang_launch=args.hip_clang_launch)
+    hip_clang_launch=is_hip_clang())

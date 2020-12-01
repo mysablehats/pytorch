@@ -236,13 +236,11 @@ void broadcast(
   ncclDataType_t data_type = _get_data_type(tensors[0]);
   int64_t numel = tensors[0].numel();
 
-  std::lock_guard<std::mutex> free_mutex(
-      *(c10::cuda::CUDACachingAllocator::getFreeMutex()));
+  AutoNcclGroup nccl_group_guard;
   const auto comms = user_comms.empty() ? _get_communicators(tensors)
                                         : ArrayRef<ncclComm_t>(user_comms);
 
   at::cuda::OptionalCUDAGuard device_guard;
-  AutoNcclGroup nccl_group_guard;
   for (size_t i = 0, num_tensors = tensors.size(); i < num_tensors; i++) {
     int device = tensors[i].get_device();
     device_guard.set_index(device);
@@ -250,7 +248,7 @@ void broadcast(
     const auto stream = (streams.empty() || !streams[i])
         ? at::cuda::getCurrentCUDAStream(device).stream()
         : streams[i]->stream();
-    AT_CHECK(
+    TORCH_CHECK(
         static_cast<uint64_t>(numel) <= static_cast<uint64_t>(count_max),
         "Broadcast tensor has ",
         numel,
@@ -275,7 +273,7 @@ void reduce(
     const comm_list& user_comms) {
 #ifdef USE_NCCL
   using namespace torch::cuda::nccl::detail;
-  AT_CHECK(
+  TORCH_CHECK(
       root >= 0 && static_cast<size_t>(root) < inputs.size(), "invalid root");
 
   _check_inputs(inputs, outputs, 1, 1);
@@ -284,12 +282,11 @@ void reduce(
   ncclDataType_t data_type = _get_data_type(inputs[0]);
 
   const auto count = inputs[0].numel();
-  std::lock_guard<std::mutex> lock(*(c10::cuda::CUDACachingAllocator::getFreeMutex()));
+  AutoNcclGroup nccl_group_guard;
   auto comms_ref = user_comms.empty() ? _get_communicators(inputs)
                                       : ArrayRef<ncclComm_t>(user_comms);
 
   at::cuda::OptionalCUDAGuard device_guard;
-  AutoNcclGroup nccl_group_guard;
   for (size_t i = 0; i < len; i++) {
     int device = inputs[i].device().index();
     device_guard.set_index(device);

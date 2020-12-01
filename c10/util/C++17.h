@@ -8,6 +8,7 @@
 #include <sstream>
 #include <string>
 #include <cstdlib>
+#include <functional>
 #include <c10/macros/Macros.h>
 
 /*
@@ -28,6 +29,7 @@ template<class T> using result_of_t = std::result_of_t<T>;
 template<class T> using decay_t = std::decay_t<T>;
 template<class T> using remove_const_t = std::remove_const_t<T>;
 template<class T> using remove_pointer_t = std::remove_pointer_t<T>;
+template<class... T> using common_type_t = std::common_type_t<T...>;
 #else
 template<bool B, class T, class F> using conditional_t = typename std::conditional<B, T, F>::type;
 template<bool B, class T = void> using enable_if_t = typename std::enable_if<B, T>::type;
@@ -38,6 +40,7 @@ template<class T> using result_of_t = typename std::result_of<T>::type;
 template<class T> using decay_t = typename std::decay<T>::type;
 template<class T> using remove_const_t = typename std::remove_const<T>::type;
 template<class T> using remove_pointer_t = typename std::remove_pointer<T>::type;
+template<class... T> using common_type_t = typename std::common_type<T...>::type;
 #endif
 
 
@@ -88,6 +91,12 @@ typename std::enable_if<std::extent<T>::value != 0, std::unique_ptr<T>>::type
 make_unique(Args&&...) = delete;
 
 #endif
+
+template <typename Base, typename Child, typename... Args>
+typename std::enable_if<!std::is_array<Base>::value && !std::is_array<Base>::value && std::is_base_of<Base, Child>::value, std::unique_ptr<Base>>::type
+make_unique_base(Args&&... args) {
+  return std::unique_ptr<Base>(new Child(c10::guts::forward<Args>(args)...));
+}
 
 
 
@@ -194,13 +203,24 @@ inline constexpr decltype(auto) apply(F&& f, Tuple&& t) {
 // TODO This is an incomplete implementation of std::apply, not working for member functions.
 namespace detail {
 template <class F, class Tuple, std::size_t... I>
-constexpr auto apply_impl(F&& f, Tuple&& t, guts::index_sequence<I...>) -> decltype(c10::guts::forward<F>(f)(std::get<I>(c10::guts::forward<Tuple>(t))...))
+#if defined(_MSC_VER)
+// MSVC has a problem with the decltype() return type, but it also doesn't need it
+// Also, nvcc on Windows needs C10_HOST_DEVICE here.
+C10_HOST_DEVICE constexpr auto apply_impl(F&& f, Tuple&& t, guts::index_sequence<I...>)
+#else
+// GCC/Clang need the decltype() return type and rocm doesn't like the C10_HOST_DEVICE
+constexpr auto apply_impl(F&& f, Tuple&& t, guts::index_sequence<I...>)
+-> decltype(c10::guts::forward<F>(f)(std::get<I>(c10::guts::forward<Tuple>(t))...))
+#endif
 {
     return c10::guts::forward<F>(f)(std::get<I>(c10::guts::forward<Tuple>(t))...);
 }
 }  // namespace detail
 
 template <class F, class Tuple>
+#if defined(_MSC_VER)
+C10_HOST_DEVICE // rocm doesn't like the C10_HOST_DEVICE
+#endif
 constexpr auto apply(F&& f, Tuple&& t) -> decltype(detail::apply_impl(
     c10::guts::forward<F>(f), c10::guts::forward<Tuple>(t),
     guts::make_index_sequence<std::tuple_size<guts::remove_reference_t<Tuple>>::value>{}))
@@ -215,18 +235,21 @@ constexpr auto apply(F&& f, Tuple&& t) -> decltype(detail::apply_impl(
 
 
 
-#if defined(_MSC_VER) && defined(__CUDACC__) && \
-    (__CUDACC_VER_MAJOR__ >= 10 || (__CUDACC_VER_MAJOR__ == 9 && __CUDACC_VER_MINOR__ >= 2))
-// workaround: CUDA >= v9.2 compiler cannot compile correctly on Windows.
-#  define AT_CPP14_CONSTEXPR
-#else
-#if defined(__cpp_constexpr) && __cpp_constexpr >= 201304
-#  define AT_CPP14_CONSTEXPR constexpr
-#else
-#  define AT_CPP14_CONSTEXPR
-#endif
-#endif
+template <typename Functor, typename... Args>
+typename std::enable_if<
+    std::is_member_pointer<typename std::decay<Functor>::type>::value,
+    typename std::result_of<Functor && (Args && ...)>::type>::type
+invoke(Functor&& f, Args&&... args) {
+  return std::mem_fn(f)(std::forward<Args>(args)...);
+}
 
+template <typename Functor, typename... Args>
+typename std::enable_if<
+    !std::is_member_pointer<typename std::decay<Functor>::type>::value,
+    typename std::result_of<Functor && (Args && ...)>::type>::type
+invoke(Functor&& f, Args&&... args) {
+  return std::forward<Functor>(f)(std::forward<Args>(args)...);
+}
 
 
 
@@ -241,6 +264,7 @@ namespace std {
 // std::to_string() call, then you're calling std::to_string() but should be calling
 // c10::guts::to_string().
 inline std::string to_string(c10::guts::detail::DummyClassForToString) { return ""; }
+
 }
 namespace c10 { namespace guts { namespace detail {
 

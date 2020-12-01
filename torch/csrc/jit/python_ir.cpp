@@ -19,6 +19,8 @@
 namespace torch {
 namespace jit {
 
+Symbol ConcretePythonOp::Kind = prim::PythonOp;
+
 using c10::Type;
 
 std::string getPythonName(const PyObject* obj_) {
@@ -137,7 +139,6 @@ void ConcretePythonOp::cloneFrom(Node* other_) {
   this->cconv = other->cconv;
   Py_INCREF(other->pyobj.get());
   this->pyobj = THPObjectPtr(other->pyobj.get());
-  this->ignore_on_export = other->ignore_on_export;
   for (auto& sa : other->scalar_args) {
     Py_INCREF(sa.get());
     this->scalar_args.emplace_back(sa.get());
@@ -212,10 +213,12 @@ void initPythonIRBindings(PyObject* module_) {
       .def(
           "__repr__",
           [](Graph& g) {
-            std::stringstream ss;
-            ss << g;
-            return ss.str();
+            return g.toString();
           })
+      .def(
+          "str",
+          &Graph::toString,
+          py::arg("print_source_ranges") = true)
       .def(
           "dump_alias_db",
           [](std::shared_ptr<Graph> g) {
@@ -227,16 +230,22 @@ void initPythonIRBindings(PyObject* module_) {
           [](const std::shared_ptr<Graph> g,
              const std::map<std::string, at::Tensor>& initializers,
              int64_t onnx_opset_version,
+             const std::unordered_map<std::string, std::unordered_map<int64_t, std::string>>& dynamic_axes,
              bool defer_weight_export,
-             ::torch::onnx::OperatorExportTypes operator_export_type) {
+             ::torch::onnx::OperatorExportTypes operator_export_type,
+             bool strip_doc_string,
+             bool keep_initializers_as_inputs) {
             std::string graph;
             RawDataExportMap export_map;
             std::tie(graph, export_map) = export_onnx(
                 g,
                 initializers,
                 onnx_opset_version,
+                dynamic_axes,
                 defer_weight_export,
-                operator_export_type);
+                operator_export_type,
+                strip_doc_string,
+                keep_initializers_as_inputs);
             std::unordered_map<std::string, py::bytes>
                 python_serialized_export_map;
             for (auto& kv : export_map) {
@@ -253,9 +262,12 @@ void initPythonIRBindings(PyObject* module_) {
           },
           py::arg("initializers"),
           py::arg("onnx_opset_version") = 0,
+          py::arg("dynamic_axes"),
           py::arg("defer_weight_export") = false,
           py::arg("operator_export_type") =
-              ::torch::onnx::OperatorExportTypes::ONNX)
+              ::torch::onnx::OperatorExportTypes::ONNX,
+          py::arg("strip_doc_string") = true,
+          py::arg("keep_initializers_as_inputs") = true)
       .def(
           "_pretty_print_onnx",
           [](const std::shared_ptr<Graph> g,
@@ -263,21 +275,24 @@ void initPythonIRBindings(PyObject* module_) {
              int64_t onnx_opset_version,
              bool defer_weight_export,
              ::torch::onnx::OperatorExportTypes operator_export_type,
-             bool google_printer) {
+             bool google_printer,
+             bool keep_initializers_as_inputs) {
             return pretty_print_onnx(
                 g,
                 initializers,
                 onnx_opset_version,
                 defer_weight_export,
                 operator_export_type,
-                google_printer);
+                google_printer,
+                keep_initializers_as_inputs);
           },
           py::arg("initializers"),
           py::arg("onnx_opset_version") = 0,
           py::arg("defer_weight_export") = false,
           py::arg("operator_export_type") =
               ::torch::onnx::OperatorExportTypes::ONNX,
-          py::arg("google_printer") = false)
+          py::arg("google_printer") = false,
+          py::arg("keep_initializers_as_inputs") = true)
       .def(
           "inputs",
           [](Graph& g) {
@@ -341,13 +356,8 @@ void initPythonIRBindings(PyObject* module_) {
       .def("param_node", [](Graph& g) { return g.block()->param_node(); })
       .def("return_node", [](Graph& g) { return g.block()->return_node(); })
       .def(
-          "pretty_print",
-          [](Graph& g) {
-            std::ostringstream oss;
-            g.prettyPrint(oss);
-            return oss.str();
-          })
-      .GS(createFusionGroup)
+          "createFusionGroup",
+          [](Graph& g) { return g.createWithSubgraph(prim::FusionGroup); })
       .def(
           "createClone",
           [](Graph& g, Node* n, py::object fn) {
@@ -366,7 +376,7 @@ void initPythonIRBindings(PyObject* module_) {
           "__repr__",
           [](Value& n) {
             std::stringstream ss;
-            ss << n.uniqueName() << " defined in (" << *n.node() << ")";
+            ss << n.debugName() << " defined in (" << *n.node() << ")";
             return ss.str();
           })
       .VS(type)
@@ -375,8 +385,8 @@ void initPythonIRBindings(PyObject* module_) {
       // skip owningGraph because it returns a raw pointer to a otherwise
       // std::shared_ptr stored graph object, and would cause a double free
       .VS(unique)
-      .VS(uniqueName)
-      .VS(setUniqueName)
+      .VS(debugName)
+      .VS(setDebugName)
       .VS(offset)
       .VS(uses)
       .VS(replaceAllUsesWith)
@@ -439,15 +449,9 @@ void initPythonIRBindings(PyObject* module_) {
             return ss.str();
           })
       .def(
-          "getSourceLocation",
-          [](Node& n) -> py::object {
-            std::stringstream ss;
-            if (auto sl = n.getSourceLocation()) {
-              sl->highlight(ss);
-              return py::str(ss.str());
-            } else {
-              return py::none();
-            }
+          "sourceRange",
+          [](Node& n) {
+            return n.sourceRange().str();
           })
       .def("hasMultipleOutputs", [](Node& n) { return n.outputs().size() > 1; })
       .def("outputsSize", [](Node& n) { return n.outputs().size(); })
@@ -625,25 +629,43 @@ void initPythonIRBindings(PyObject* module_) {
       .def("kind", [](const Type& t) { return typeKindToString(t.kind()); })
       .def(
           "dim",
-          [](const Type& t) {
-            return t.expect<DimensionedTensorType>()->dim();
+          [](Type& t) {
+            auto vshape = t.shared_from_this()->expect<TensorType>()->sizes();
+            return vshape.size() ? py::cast(*vshape.size())
+                                 : py::cast<py::none>(Py_None);
           })
       .def(
           "sizes",
-          [](Type& t) { return t.expect<CompleteTensorType>()->sizes(); })
+          [](Type& t) -> py::object {
+            if (auto ptt = t.expect<TensorType>()) {
+              if (auto cs = ptt->sizes().concrete_sizes()) {
+                return py::cast(*cs);
+              }
+            }
+            return py::none();
+          })
       .def(
-          "strides",
-          [](Type& t) { return t.expect<CompleteTensorType>()->strides(); })
+          "sizes",
+          [](Type& t) -> py::object {
+            if (auto ptt = t.expect<TensorType>()) {
+              if (auto cs = ptt->strides().concrete_sizes()) {
+                return py::cast(*cs);
+              }
+            }
+            return py::none();
+          })
       .def(
           "contiguous",
           [](Type& t) {
             return std::static_pointer_cast<Type>(
-                t.expect<CompleteTensorType>()->contiguous());
+                t.expect<TensorType>()->contiguous());
           })
       .def(
           "scalarType",
           [](Type& t) {
-            return toString(t.expect<DimensionedTensorType>()->scalarType());
+            auto scalar_type =
+                t.shared_from_this()->expect<TensorType>()->scalarType();
+            return (scalar_type) ? toString(*scalar_type) : nullptr;
           })
       .def(
           "__eq__",
@@ -687,12 +709,19 @@ void initPythonIRBindings(PyObject* module_) {
   py::class_<DictType, Type, std::shared_ptr<DictType>>(m, "DictType")
       .def(py::init([](TypePtr key, TypePtr value) {
         return DictType::create(key, value);
-      }));
+      }))
+      .def("getKeyType", &DictType::getKeyType)
+      .def("getValueType", &DictType::getValueType);
   py::class_<OptionalType, Type, std::shared_ptr<OptionalType>>(
       m, "OptionalType")
       .def(py::init([](TypePtr a) { return OptionalType::create(a); }))
       .def_static("ofTensor", &OptionalType::ofTensor)
       .def("getElementType", &OptionalType::getElementType);
+
+  py::class_<ClassType, Type, std::shared_ptr<ClassType>>(m, "ClassType")
+      .def(py::init([](const std::string& qualified_name) {
+        return get_python_cu()->get_class(c10::QualifiedName(qualified_name));
+      }));
 
   py::class_<Use>(m, "Use")
       .def_readonly("user", &Use::user)

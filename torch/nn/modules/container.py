@@ -41,11 +41,6 @@ class Sequential(Module):
                   ('conv2', nn.Conv2d(20,64,5)),
                   ('relu2', nn.ReLU())
                 ]))
-
-    Shape:
-        - Input: :math:`(*)` where `*` means, any number of additional
-          dimensions
-        - Output: :math:`(*)`, same shape as the input
     """
 
     def __init__(self, *args):
@@ -335,6 +330,9 @@ class ModuleDict(Module):
                                      "#" + str(j) + " has length " + str(len(m)) +
                                      "; 2 is required")
                 self[m[0]] = m[1]
+
+    def forward(self):
+        raise NotImplementedError()
 
 
 class ParameterList(Module):
